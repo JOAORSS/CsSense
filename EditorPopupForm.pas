@@ -1,0 +1,3198 @@
+﻿unit EditorPopupForm;
+
+interface
+
+uses
+  Winapi.Windows, Winapi.Messages, System.Win.Registry,
+  Vcl.Forms, Vcl.Controls, Vcl.Graphics, Vcl.Menus, Vcl.ExtCtrls, Vcl.AppEvnts,
+  System.SysUtils, System.Classes, System.IOUtils, System.StrUtils,
+  ToolsAPI, ExtratorUnit, SymbolIndex, FileWatcherNotifier, SQLiteEngine,
+  BackgroundIndexer, ConfigManager, SymbolTypes, GoToDefinition;
+
+type
+  TEditorPopup = class(TForm)
+  private
+    FCols: Integer;
+    FSelectedCol: Integer;
+    FCellW, FCellH: Integer;
+    FTopRow: Integer;
+    FTrapHeight: Integer;
+    FTitleHeight: Integer;
+    FFooterHeight: Integer;
+    FTypeColW: Integer;
+    FColorTypeCol: TColor;
+    FColorReturn: TColor;
+    FColorNumber: TColor;
+    FColorType: TColor;
+    FColorKeyword: TColor;
+    FObservedType: string;
+    FIsDraggingScroll: Boolean;
+    FDragOffset: Integer;
+    FIsMemberListMode: Boolean;
+    FAllItems: TArray<TItemRecord>;
+    FTypedStartLine: Integer;
+    FTypedStartCol: Integer;
+    FLastTypedText: string;
+    FFilterTimer: TTimer;
+    FAppEvents: TApplicationEvents;
+    FFilterMode: Integer;
+    procedure WMEraseBkgnd(var Msg: TWMEraseBkgnd); message WM_ERASEBKGND;
+    procedure WMNCHitTest(var Msg: TWMNCHitTest); message WM_NCHITTEST;
+    function GetThumbRect(out ARect: TRect): Boolean;
+    procedure OnFilterTimerFire(Sender: TObject);
+    procedure ApplyFilter(const FilterText: string);
+    procedure AppMessage(var Msg: TMsg; var Handled: Boolean);
+    procedure UpdateRegion;
+    function GetTrapWidth: Integer;
+  protected
+    procedure Paint; override;
+    procedure Resize; override;
+    procedure MouseMove(Shift: TShiftState; X, Y: Integer); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Integer); override;
+    procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Integer); override;
+    procedure Deactivate; override;
+    function DoMouseWheel(Shift: TShiftState; WheelDelta: Integer; MousePos: TPoint): Boolean; override;
+    procedure CreateParams(var Params: TCreateParams); override;
+  public
+    FRows  : Integer;
+    FItems : TArray<TItemRecord>;
+    FEditorHandle: HWND;
+    FSelectedRow: Integer;
+    constructor Create(AOwner: TComponent); override;
+    procedure ShowAtPos(X, Y: Integer);
+    procedure InsertSelectedText;
+    procedure CarregarItensGrid(const CaminhoArquivo: string);
+    procedure CarregarItensLista(Members: TArray<TSymbolInfo>);
+    procedure OnHintTimerFire(Sender: TObject);
+    procedure OnAutoHintTimerFire(Sender: TObject);
+    procedure OnPointTimerFire(Sender: TObject);
+    procedure EnsureVisible;
+    procedure CycleFilterMode;
+
+    property ColorTypeCol: TColor read FColorTypeCol write FColorTypeCol;
+    property ColorReturn: TColor read FColorReturn write FColorReturn;
+    property ColorNumber: TColor read FColorNumber write FColorNumber;
+    property ColorType: TColor read FColorType write FColorType;
+    property ColorKeyword: TColor read FColorKeyword write FColorKeyword;
+    property ObservedType: string read FObservedType write FObservedType;
+  end;
+
+  TMyKeyboardBinding = class(TNotifierObject, IOTAKeyboardBinding)
+  public
+    function GetBindingType: TBindingType;
+    function GetDisplayName: string;
+    function GetName: string;
+    procedure KeyHandler(const Context: IOTAKeyContext; KeyCode: TShortCut; var BindingResult: TKeyBindingResult);
+    procedure DotKeyHandler(const Context: IOTAKeyContext; KeyCode: TShortCut; var BindingResult: TKeyBindingResult);
+    procedure BindKeyboard(const BindingServices: IOTAKeyBindingServices);
+  end;
+
+procedure Register;
+procedure ExecutarShowHintAtCursor;
+
+implementation
+
+var
+  EditorPopupInstance: TEditorPopup;
+  GInsertParamsStr: Boolean = False;
+  GHintActive: Boolean;
+  GHintLinearStart: Integer;
+  GHintEditView: IOTAEditView;
+  GHintTimer: TTimer;
+  GAutoHintTimer: TTimer;
+  GTemplateActive: Boolean;
+  GTemplateParams: TArray<string>;
+  GTemplateParamIdx: Integer;
+  GTemplateSearchFrom: Integer;
+  GTemplateZoneEnd: Integer;
+  GKeyboardBindingIndex: Integer = -1;
+  GIDENotifierIndex: Integer = -1;
+  GGlobalSearchPaths: TArray<string>;
+  GPointTimer: TTimer;
+
+type
+  TParamHintForm = class(TForm)
+  private
+    FText: string;
+    FActiveIndex: Integer;
+    FActiveStart: Integer;
+    FActiveEnd: Integer;
+    procedure WMEraseBkgnd(var Msg: TWMEraseBkgnd); message WM_ERASEBKGND;
+  protected
+    procedure Paint; override;
+    procedure CreateParams(var Params: TCreateParams); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    procedure ShowHint(X, Y: Integer; const AText: string);
+    procedure UpdateActiveParam(Index: Integer);
+  end;
+
+var
+  GParamHintForm: TParamHintForm;
+
+function GetSafeFileName(const Path: string): string;
+var
+  I: Integer;
+begin
+  Result := Path;
+  for I := 1 to Length(Result) do
+    if CharInSet(Result[I], ['\', '/', ':', '*', '?', '"', '<', '>', '|']) then
+      Result[I] := '_';
+end;
+
+procedure TriggerProjectIndexing;
+var
+  ModSvc: IOTAModuleServices;
+  Project: IOTAProject;
+  FilesList: TStringList;
+  ArrFiles: TArray<string>;
+  I: Integer;
+  ModuleInfo: IOTAModuleInfo;
+  Opts: IOTAProjectOptions;
+  SearchPath, ProjDir, BDS, PStr, FullPath: string;
+  Paths: TArray<string>;
+  SR: TSearchRec;
+  PublicPath: string;
+  LocalFiles: TArray<string>;
+  PublicFiles: TArray<string>;
+  CurrentPaths: TArray<string>;
+  AppData: string;
+  LocalPath: string;
+begin
+  OutputDebugString(PChar('[CS-CodeInsight] Tentando iniciar indexacao do projeto...'));
+
+  if BorlandIDEServices.QueryInterface(IOTAModuleServices, ModSvc) <> S_OK then Exit;
+  Project := ModSvc.GetActiveProject;
+
+  if not Assigned(Project) then
+  begin
+    OutputDebugString(PChar('[CS-CodeInsight] Nenhum projeto ativo no momento.'));
+    Exit;
+  end;
+
+  ProjDir := ExtractFilePath(Project.FileName);
+  if ProjDir = '' then Exit;
+
+  OutputDebugString(PChar('[CS-CodeInsight] Projeto ativo encontrado: ' + ProjDir));
+  GCurrentProjectDir := ProjDir;
+
+  AppData := TPath.Combine(TPath.GetHomePath, 'CodeInsight');
+
+  PStr := ExtractFileName(ExcludeTrailingPathDelimiter(ProjDir));
+  if PStr = '' then PStr := 'DefaultProject';
+  PStr := GetSafeFileName(PStr);
+
+  AppData := TPath.Combine(AppData, PStr);
+  ForceDirectories(AppData);
+  LocalPath := TPath.Combine(AppData, 'local.db');
+
+  if GLocalDB.IsConnected and not SameText(GLocalDB.DBPath, LocalPath) then
+    GLocalDB.Disconnect;
+
+  if not GLocalDB.IsConnected then
+    GLocalDB.Connect(LocalPath);
+
+  SetLength(CurrentPaths, Length(GGlobalSearchPaths));
+  for I := 0 to High(GGlobalSearchPaths) do
+    CurrentPaths[I] := GGlobalSearchPaths[I];
+
+  SetLength(CurrentPaths, Length(CurrentPaths) + 1);
+  CurrentPaths[High(CurrentPaths)] := ProjDir;
+
+  PublicPath := TPath.GetFullPath(TPath.Combine(ProjDir, '..\PublicoV11'));
+  if DirectoryExists(PublicPath) then
+  begin
+    SetLength(CurrentPaths, Length(CurrentPaths) + 1);
+    CurrentPaths[High(CurrentPaths)] := PublicPath;
+  end;
+
+  if Assigned(GSymbolIndex) then
+    GSymbolIndex.SetSearchPaths(CurrentPaths);
+
+  FilesList := TStringList.Create;
+  try
+    for I := 0 to Project.GetModuleCount - 1 do
+    begin
+      ModuleInfo := Project.GetModule(I);
+      if Assigned(ModuleInfo) and SameText(ExtractFileExt(ModuleInfo.FileName), '.pas') then
+        FilesList.Add(ModuleInfo.FileName);
+    end;
+
+    BDS := '';
+    Opts := Project.ProjectOptions;
+    if Assigned(Opts) then
+    begin
+      try
+        SearchPath := Opts.Values['UnitSearchPath'];
+        if SearchPath <> '' then
+        begin
+          Paths := SearchPath.Split([';']);
+          for PStr in Paths do
+          begin
+            if Trim(PStr) = '' then Continue;
+            FullPath := ReplaceText(PStr, '$(BDS)', BDS);
+            if TPath.IsRelativePath(FullPath) then
+              FullPath := TPath.Combine(ProjDir, FullPath);
+
+            try
+              FullPath := TPath.GetFullPath(FullPath);
+              if DirectoryExists(FullPath) then
+              begin
+                if FindFirst(TPath.Combine(FullPath, '*.pas'), faAnyFile, SR) = 0 then
+                begin
+                  try
+                    repeat
+                      if (SR.Name <> '.') and (SR.Name <> '..') then
+                        FilesList.Add(TPath.Combine(FullPath, SR.Name));
+                    until FindNext(SR) <> 0;
+                  finally
+                    System.SysUtils.FindClose(SR);
+                  end;
+                end;
+              end;
+            except
+            end;
+          end;
+        end;
+      except
+      end;
+    end;
+
+    SetLength(ArrFiles, FilesList.Count);
+    for I := 0 to FilesList.Count - 1 do
+    begin
+      ArrFiles[I] := FilesList[I];
+      if SameText(ExtractFileName(ArrFiles[I]), 'DadosF.pas') then
+      begin
+        if Assigned(GSymbolIndex) then
+          GSymbolIndex.IndexFile(ArrFiles[I], True);
+      end;
+    end;
+
+    if Assigned(GSymbolIndex) then
+      GSymbolIndex.BuildProjectIndex(ArrFiles);
+  finally
+    FilesList.Free;
+  end;
+
+  try
+    LocalFiles := TDirectory.GetFiles(ProjDir, '*.pas', TSearchOption.soAllDirectories);
+  except
+    LocalFiles := nil;
+  end;
+
+  if DirectoryExists(PublicPath) then
+  begin
+    if GPublicDir = '' then GPublicDir := PublicPath;
+    try
+      PublicFiles := TDirectory.GetFiles(PublicPath, '*.pas', TSearchOption.soAllDirectories);
+    except
+      PublicFiles := nil;
+    end;
+  end
+  else if GPublicDir <> '' then
+  begin
+    try
+      if DirectoryExists(GPublicDir) then
+        PublicFiles := TDirectory.GetFiles(GPublicDir, '*.pas', TSearchOption.soAllDirectories)
+      else
+        PublicFiles := nil;
+    except
+      PublicFiles := nil;
+    end;
+  end
+  else
+    PublicFiles := nil;
+
+  if Length(LocalFiles) > 0 then
+    TBackgroundIndexer.Create(LocalFiles, GLocalDB.DBPath).Start;
+
+  if Length(PublicFiles) > 0 then
+    TBackgroundIndexer.Create(PublicFiles, GPublicDB.DBPath).Start;
+end;
+
+type
+  TMyIDENotifier = class(TNotifierObject, IOTAIDENotifier)
+  public
+    procedure FileNotification(NotifyCode: TOTAFileNotification; const FileName: string; var Cancel: Boolean);
+    procedure BeforeCompile(const Project: IOTAProject; var Cancel: Boolean);
+    procedure AfterCompile(Succeeded: Boolean);
+  end;
+
+procedure TMyIDENotifier.FileNotification(NotifyCode: TOTAFileNotification; const FileName: string; var Cancel: Boolean);
+begin
+  if (NotifyCode = ofnActiveProjectChanged) or (NotifyCode = ofnEndProjectGroupOpen) then
+  begin
+    OutputDebugString(PChar('[CS-CodeInsight] Evento de projeto detectado.'));
+    TriggerProjectIndexing;
+  end;
+end;
+
+procedure TMyIDENotifier.BeforeCompile(const Project: IOTAProject; var Cancel: Boolean);
+begin
+end;
+
+procedure TMyIDENotifier.AfterCompile(Succeeded: Boolean);
+begin
+end;
+
+constructor TParamHintForm.Create(AOwner: TComponent);
+begin
+  inherited CreateNew(AOwner);
+  BorderStyle := bsNone;
+  FormStyle := fsStayOnTop;
+  Color := $002B2B2B;
+  DoubleBuffered := True;
+  FActiveIndex := -1;
+  FActiveStart := 1;
+  FActiveEnd := 0;
+end;
+
+procedure TParamHintForm.CreateParams(var Params: TCreateParams);
+begin
+  inherited;
+  Params.Style := WS_POPUP;
+  Params.ExStyle := Params.ExStyle or WS_EX_NOACTIVATE;
+  Params.WndParent := Application.Handle;
+end;
+
+procedure TParamHintForm.WMEraseBkgnd(var Msg: TWMEraseBkgnd);
+begin
+  Msg.Result := 1;
+end;
+
+procedure TParamHintForm.UpdateActiveParam(Index: Integer);
+var
+  I, Depth, CurrentParam: Integer;
+begin
+  if FActiveIndex = Index then Exit;
+  FActiveIndex := Index;
+  FActiveStart := 1;
+  FActiveEnd := Length(FText);
+  Depth := 0;
+  CurrentParam := 0;
+
+  for I := 1 to Length(FText) do
+  begin
+    if CharInSet(FText[I], ['(', '<', '[']) then Inc(Depth)
+    else if CharInSet(FText[I], [')', '>', ']']) then Dec(Depth);
+
+    if (Depth = 0) and CharInSet(FText[I], [',', ';']) then
+    begin
+      if CurrentParam = Index then
+      begin
+        FActiveEnd := I - 1;
+        Break;
+      end;
+      Inc(CurrentParam);
+      if CurrentParam = Index then
+        FActiveStart := I + 1;
+    end;
+  end;
+  Invalidate;
+end;
+
+procedure DrawSyntaxHighlight(ACanvas: TCanvas; X, Y: Integer; const S, Utilizavel: string; ItemTipo: Integer; BaseColor, NumColor, TypeColor, RetColor, KwColor: TColor; IsSelected: Boolean; const FilterStr: string);
+var
+  I, StartIdx, LastColonPos: Integer;
+  Token: string;
+  IsReturnArea, NameBolded: Boolean;
+  S1, S2, S3: string;
+  MatchPos: Integer;
+
+  function IsKnownType(const Str: string): Boolean;
+  begin
+    if Str = '' then Exit(False);
+    if SameText(Str, 'string') or SameText(Str, 'integer') or SameText(Str, 'boolean') or
+       SameText(Str, 'char') or SameText(Str, 'byte') or SameText(Str, 'word') or
+       SameText(Str, 'double') or SameText(Str, 'extended') or SameText(Str, 'variant') or
+       SameText(Str, 'pointer') or SameText(Str, 'real') or SameText(Str, 'int64') or
+       SameText(Str, 'tdatetime') then Exit(True);
+    if (Length(Str) >= 2) and CharInSet(Str[1], ['T', 'I']) and CharInSet(Str[2], ['A'..'Z']) then
+      Exit(True);
+    Result := False;
+  end;
+
+  function IsKeyword(const Str: string): Boolean;
+  begin
+    Result := SameText(Str, 'const') or SameText(Str, 'var') or
+              SameText(Str, 'out') or SameText(Str, 'in') or
+              SameText(Str, 'procedure') or SameText(Str, 'function') or
+              SameText(Str, 'property') or SameText(Str, 'constructor') or
+              SameText(Str, 'destructor') or SameText(Str, 'class') or
+              SameText(Str, 'interface') or SameText(Str, 'record') or
+              SameText(Str, 'type') or SameText(Str, 'array') or
+              SameText(Str, 'of') or SameText(Str, 'override') or
+              SameText(Str, 'virtual') or SameText(Str, 'abstract') or
+              SameText(Str, 'overload');
+  end;
+
+begin
+  LastColonPos := -1;
+  if ItemTipo = 2 then
+  begin
+    for I := Length(S) downto 1 do
+      if S[I] = ':' then
+      begin
+        LastColonPos := I;
+        Break;
+      end;
+  end;
+
+  IsReturnArea := False;
+  NameBolded := False;
+  I := 1;
+  while I <= Length(S) do
+  begin
+    if CharInSet(S[I], ['a'..'z', 'A'..'Z', '_']) then
+    begin
+      StartIdx := I;
+      while (I <= Length(S)) and CharInSet(S[I], ['a'..'z', 'A'..'Z', '0'..'9', '_']) do Inc(I);
+      Token := Copy(S, StartIdx, I - StartIdx);
+
+      if IsSelected then ACanvas.Font.Style := [fsBold]
+      else ACanvas.Font.Style := [];
+
+      if IsReturnArea then ACanvas.Font.Color := RetColor
+      else if IsKeyword(Token) then ACanvas.Font.Color := KwColor
+      else if IsKnownType(Token) then ACanvas.Font.Color := TypeColor
+      else ACanvas.Font.Color := BaseColor;
+
+      if (not NameBolded) and SameText(Token, Utilizavel) then
+      begin
+        ACanvas.Font.Style := ACanvas.Font.Style + [fsBold];
+        NameBolded := True;
+
+        if FilterStr <> '' then
+        begin
+          MatchPos := Pos(UpperCase(FilterStr), UpperCase(Token));
+          if MatchPos > 0 then
+          begin
+            S1 := Copy(Token, 1, MatchPos - 1);
+            S2 := Copy(Token, MatchPos, Length(FilterStr));
+            S3 := Copy(Token, MatchPos + Length(FilterStr), MaxInt);
+
+            if S1 <> '' then
+            begin
+              ACanvas.TextOut(X, Y, S1);
+              Inc(X, ACanvas.TextWidth(S1));
+            end;
+
+            ACanvas.Font.Style := ACanvas.Font.Style + [fsUnderline];
+            ACanvas.TextOut(X, Y, S2);
+            Inc(X, ACanvas.TextWidth(S2));
+            ACanvas.Font.Style := ACanvas.Font.Style - [fsUnderline];
+
+            if S3 <> '' then
+            begin
+              ACanvas.TextOut(X, Y, S3);
+              Inc(X, ACanvas.TextWidth(S3));
+            end;
+          end
+          else
+          begin
+            ACanvas.TextOut(X, Y, Token);
+            Inc(X, ACanvas.TextWidth(Token));
+          end;
+        end
+        else
+        begin
+          ACanvas.TextOut(X, Y, Token);
+          Inc(X, ACanvas.TextWidth(Token));
+        end;
+      end
+      else
+      begin
+        ACanvas.TextOut(X, Y, Token);
+        Inc(X, ACanvas.TextWidth(Token));
+      end;
+    end
+    else if CharInSet(S[I], ['0'..'9', '$']) then
+    begin
+      StartIdx := I;
+      while (I <= Length(S)) and CharInSet(S[I], ['0'..'9', '.', 'x', 'X', 'a'..'f', 'A'..'F', '$']) do Inc(I);
+      Token := Copy(S, StartIdx, I - StartIdx);
+
+      if IsSelected then ACanvas.Font.Style := [fsBold]
+      else ACanvas.Font.Style := [];
+
+      ACanvas.Font.Color := NumColor;
+      ACanvas.TextOut(X, Y, Token);
+      Inc(X, ACanvas.TextWidth(Token));
+    end
+    else
+    begin
+      StartIdx := I;
+      while (I <= Length(S)) and not CharInSet(S[I], ['a'..'z', 'A'..'Z', '0'..'9', '_']) do
+      begin
+        if (S[I] = ':') and (I = LastColonPos) then IsReturnArea := True;
+        Inc(I);
+      end;
+      Token := Copy(S, StartIdx, I - StartIdx);
+
+      if IsSelected then ACanvas.Font.Style := [fsBold]
+      else ACanvas.Font.Style := [];
+
+      ACanvas.Font.Color := BaseColor;
+      ACanvas.TextOut(X, Y, Token);
+      Inc(X, ACanvas.TextWidth(Token));
+    end;
+  end;
+end;
+
+procedure TParamHintForm.Paint;
+var
+  X, Y: Integer;
+  S1, S2, S3: string;
+begin
+  Canvas.Brush.Color := $002B2B2B;
+  Canvas.FillRect(ClientRect);
+  Canvas.Pen.Color := $00A36215;
+  Canvas.Rectangle(0, 0, Width, Height);
+
+  Canvas.Font.Name := 'Consolas';
+  Canvas.Font.Size := 10;
+  Canvas.Brush.Style := bsClear;
+
+  X := 8;
+  Y := 4;
+
+  S1 := Copy(FText, 1, FActiveStart - 1);
+  S2 := Copy(FText, FActiveStart, FActiveEnd - FActiveStart + 1);
+  S3 := Copy(FText, FActiveEnd + 1, MaxInt);
+
+  if S1 <> '' then
+  begin
+    Canvas.Font.Style := [];
+    Canvas.Font.Color := $00A0A0A0;
+    Canvas.TextOut(X, Y, S1);
+    X := X + Canvas.TextWidth(S1);
+  end;
+
+  if S2 <> '' then
+  begin
+    Canvas.Font.Style := [fsBold];
+    Canvas.Font.Color := clWhite;
+    Canvas.TextOut(X, Y, S2);
+    X := X + Canvas.TextWidth(S2);
+  end;
+
+  if S3 <> '' then
+  begin
+    Canvas.Font.Style := [];
+    Canvas.Font.Color := $00A0A0A0;
+    Canvas.TextOut(X, Y, S3);
+  end;
+end;
+
+procedure TParamHintForm.ShowHint(X, Y: Integer; const AText: string);
+var
+  W, H: Integer;
+  Monitor: TMonitor;
+  WorkArea: TRect;
+  TargetX, TargetY: Integer;
+begin
+  FText := AText;
+  FActiveIndex := -1;
+  Canvas.Font.Name := 'Consolas';
+  Canvas.Font.Size := 10;
+  Canvas.Font.Style := [fsBold];
+  W := Canvas.TextWidth(FText) + 16;
+  H := Canvas.TextHeight(FText) + 8;
+
+  TargetX := X;
+  TargetY := Y - H;
+
+  Monitor := Screen.MonitorFromPoint(Point(X, Y));
+  if Assigned(Monitor) then
+    WorkArea := Monitor.WorkareaRect
+  else
+    WorkArea := Screen.DesktopRect;
+
+  if TargetY < WorkArea.Top then TargetY := Y + 24;
+  if TargetX + W > WorkArea.Right then TargetX := WorkArea.Right - W;
+  if TargetX < WorkArea.Left then TargetX := WorkArea.Left;
+
+  SetBounds(TargetX, TargetY, W, H);
+  ShowWindow(Handle, SW_SHOWNOACTIVATE);
+  Visible := True;
+  UpdateActiveParam(0);
+end;
+
+constructor TEditorPopup.Create(AOwner: TComponent);
+begin
+  inherited CreateNew(AOwner);
+  BorderStyle  := bsNone;
+  Color        := $002B2B2B;
+  Position     := poDesigned;
+  Constraints.MinWidth  := 312;
+  Constraints.MinHeight := 105;
+  FRows        := 0;
+  FCols        := 1;
+  FCellW       := 300;
+  FCellH       := 24;
+  FSelectedRow := -1;
+  FSelectedCol := -1;
+  FTopRow      := 0;
+  FTrapHeight  := 20;
+  FTitleHeight := 24;
+  FFooterHeight := 18;
+  FTypeColW    := 90;
+  Width        := 312;
+  Height       := 230;
+  FormStyle    := fsStayOnTop;
+  KeyPreview   := True;
+  DoubleBuffered := True;
+  FColorTypeCol := $00E2B855;
+  FColorReturn  := $009774E0;
+  FColorNumber  := $008CC69B;
+  FColorType    := $005EC8E5;
+  FColorKeyword := $00D69C56;
+  FIsMemberListMode := False;
+  FFilterMode  := 0;
+
+  FFilterTimer := TTimer.Create(Self);
+  FFilterTimer.Interval := 100;
+  FFilterTimer.Enabled := False;
+  FFilterTimer.OnTimer := OnFilterTimerFire;
+
+  FAppEvents := TApplicationEvents.Create(Self);
+  FAppEvents.OnMessage := AppMessage;
+end;
+
+procedure TEditorPopup.CreateParams(var Params: TCreateParams);
+begin
+  inherited;
+  Params.Style := WS_POPUP;
+  Params.ExStyle := Params.ExStyle or WS_EX_NOACTIVATE;
+  Params.WndParent := Application.Handle;
+end;
+
+function TEditorPopup.GetTrapWidth: Integer;
+var
+  FilterName: string;
+  MinW: Integer;
+begin
+  Result := 0;
+  if FFilterMode = 0 then Exit;
+  Canvas.Font.Name := 'Consolas';
+  Canvas.Font.Size := 9;
+  Canvas.Font.Style := [fsItalic];
+  MinW := Canvas.TextWidth('filtro: alfabética') + 24;
+  FilterName := '';
+  case FFilterMode of
+    1: FilterName := 'A-Z';
+    2: FilterName := 'Z-A';
+    3: FilterName := 'Keywords';
+  end;
+  Result := Canvas.TextWidth('filtro: ' + FilterName) + 24;
+  if Result < MinW then Result := MinW;
+end;
+
+procedure TEditorPopup.UpdateRegion;
+var
+  RgnMain, RgnTrap: HRGN;
+  Pts: array[0..3] of TPoint;
+  TrapW: Integer;
+begin
+  RgnMain := CreateRectRgn(0, FTrapHeight, Width, Height);
+  if FFilterMode > 0 then
+  begin
+    TrapW := GetTrapWidth;
+    Pts[0] := Point(Width - TrapW + 12, 0);
+    Pts[1] := Point(Width, 0);
+    Pts[2] := Point(Width, FTrapHeight);
+    Pts[3] := Point(Width - TrapW, FTrapHeight);
+    RgnTrap := CreatePolygonRgn(Pts, 4, WINDING);
+    CombineRgn(RgnMain, RgnMain, RgnTrap, RGN_OR);
+    DeleteObject(RgnTrap);
+  end;
+  SetWindowRgn(Handle, RgnMain, True);
+end;
+
+procedure TEditorPopup.CycleFilterMode;
+begin
+  Inc(FFilterMode);
+  if FFilterMode > 3 then FFilterMode := 0;
+  UpdateRegion;
+  ApplyFilter(FLastTypedText);
+  Invalidate;
+end;
+
+function LerBufferEditor(const EditBuffer: IOTAEditBuffer): string;
+var
+  Reader   : IOTAEditReader;
+  Buf      : array[0..8191] of Byte;
+  BytesRead: Integer;
+  Offset   : Integer;
+  MemStream: TMemoryStream;
+  S        : AnsiString;
+begin
+  Result := '';
+  if not Assigned(EditBuffer) then Exit;
+  Reader := EditBuffer.CreateReader;
+  if not Assigned(Reader) then Exit;
+  MemStream := TMemoryStream.Create;
+  try
+    Offset := 0;
+    repeat
+      BytesRead := Reader.GetText(Offset, @Buf[0], SizeOf(Buf));
+      if BytesRead > 0 then
+      begin
+        MemStream.WriteBuffer(Buf[0], BytesRead);
+        Inc(Offset, BytesRead);
+      end;
+    until BytesRead = 0;
+    if MemStream.Size > 0 then
+    begin
+      SetString(S, PAnsiChar(MemStream.Memory), MemStream.Size);
+      Result := string(S);
+    end;
+  finally
+    MemStream.Free;
+  end;
+end;
+
+function RowColToLinearPos(const Text: string; TargetRow, TargetCol: Integer): Integer;
+var
+  I, Row, Col: Integer;
+begin
+  Row := 1;
+  Col := 1;
+  for I := 1 to Length(Text) do
+  begin
+    if (Row = TargetRow) and (Col = TargetCol) then Exit(I);
+    if Text[I] = #10 then
+    begin
+      Inc(Row);
+      Col := 1;
+    end
+    else if Text[I] <> #13 then
+      Inc(Col);
+  end;
+  Result := Length(Text) + 1;
+end;
+
+procedure LinearPosToRowCol(const Text: string; PosLinear: Integer; out Row, Col: Integer);
+var
+  I: Integer;
+begin
+  Row := 1;
+  Col := 1;
+  for I := 1 to PosLinear - 1 do
+  begin
+    if Text[I] = #10 then
+    begin
+      Inc(Row);
+      Col := 1;
+    end
+    else if Text[I] <> #13 then
+    begin
+      Inc(Col);
+    end;
+  end;
+end;
+
+function FindAndSelectNextParam(EditView: IOTAEditView): Boolean;
+var
+  Content : string;
+  HitPos  : Integer;
+  Row, Col, EndRow, EndCol: Integer;
+  PName   : string;
+  CharBefore, CharAfter: Char;
+begin
+  Result := False;
+  if not Assigned(EditView) or not GTemplateActive then Exit;
+
+  if GTemplateParamIdx >= Length(GTemplateParams) then
+  begin
+    GTemplateActive := False;
+    Exit;
+  end;
+
+  Content := LerBufferEditor(EditView.Buffer);
+
+  while GTemplateParamIdx < Length(GTemplateParams) do
+  begin
+    PName  := GTemplateParams[GTemplateParamIdx];
+    HitPos := PosEx(PName, Content, GTemplateSearchFrom);
+
+    if (HitPos > 0) and (HitPos + Length(PName) - 1 <= GTemplateZoneEnd) then
+    begin
+      if HitPos > 1 then CharBefore := Content[HitPos - 1] else CharBefore := ' ';
+      if HitPos + Length(PName) <= Length(Content) then
+        CharAfter := Content[HitPos + Length(PName)]
+      else
+        CharAfter := ' ';
+
+      if not CharInSet(CharBefore, ['a'..'z','A'..'Z','0'..'9','_']) and
+         not CharInSet(CharAfter,  ['a'..'z','A'..'Z','0'..'9','_']) then
+      begin
+        LinearPosToRowCol(Content, HitPos, Row, Col);
+        LinearPosToRowCol(Content, HitPos + Length(PName), EndRow, EndCol);
+
+        EditView.Position.Move(Row, Col);
+        EditView.Block.BeginBlock;
+        EditView.Block.Extend(EndRow, EndCol);
+        EditView.Paint;
+
+        GTemplateSearchFrom := HitPos + Length(PName);
+        Inc(GTemplateParamIdx);
+
+        Result := True;
+        Exit;
+      end;
+    end;
+    Inc(GTemplateParamIdx);
+  end;
+
+  GTemplateActive := False;
+end;
+
+procedure TEditorPopup.AppMessage(var Msg: TMsg; var Handled: Boolean);
+var
+  EditSvc: IOTAEditorServices;
+begin
+  if Msg.message = WM_CHAR then
+  begin
+    if (Chr(Msg.wParam) = '(') or ((Chr(Msg.wParam) = ',') and not GHintActive) then
+    begin
+      if Assigned(GAutoHintTimer) then
+      begin
+        GAutoHintTimer.Enabled := False;
+        GAutoHintTimer.Enabled := True;
+      end;
+    end
+    else if Chr(Msg.wParam) = '.' then
+    begin
+      if Assigned(GPointTimer) then
+      begin
+        GPointTimer.Enabled := False;
+        GPointTimer.Enabled := True;
+      end;
+    end;
+  end;
+
+  if (Msg.message = WM_KEYDOWN) then
+  begin
+    if GHintActive and (Msg.wParam = VK_ESCAPE) then
+    begin
+      GHintActive := False;
+      if Assigned(GParamHintForm) then GParamHintForm.Hide;
+      Handled := True;
+      Exit;
+    end;
+
+    if GTemplateActive and (Msg.wParam = VK_ESCAPE) then
+    begin
+      GTemplateActive := False;
+      Handled := True;
+      Exit;
+    end;
+
+    if GTemplateActive and (Msg.wParam = VK_TAB) and (GetKeyState(VK_SHIFT) >= 0) then
+    begin
+      if BorlandIDEServices.QueryInterface(IOTAEditorServices, EditSvc) = S_OK then
+      begin
+        if FindAndSelectNextParam(EditSvc.TopView) then
+        begin
+          Handled := True;
+          Exit;
+        end
+        else
+          GTemplateActive := False;
+      end;
+    end;
+
+    if Visible then
+    begin
+      if (Msg.wParam = VK_TAB) and (GetKeyState(VK_SHIFT) < 0) then
+      begin
+        CycleFilterMode;
+        Handled := True;
+        Exit;
+      end;
+
+      case Msg.wParam of
+        VK_SPACE:
+          begin
+            Hide;
+          end;
+        VK_ESCAPE:
+          begin
+            Hide;
+            Handled := True;
+          end;
+        VK_UP:
+          begin
+            if FSelectedRow > 0 then
+            begin
+              Dec(FSelectedRow);
+              EnsureVisible;
+              Invalidate;
+            end;
+            Handled := True;
+          end;
+        VK_DOWN:
+          begin
+            if FSelectedRow < FRows - 1 then
+            begin
+              Inc(FSelectedRow);
+              EnsureVisible;
+              Invalidate;
+            end;
+            Handled := True;
+          end;
+        VK_RETURN:
+          begin
+            InsertSelectedText;
+            Handled := True;
+          end;
+      end;
+    end;
+  end;
+end;
+
+function LimparEspacos(const Texto: string): string;
+var
+  I, J, Len: Integer;
+  NoEspaco: Boolean;
+begin
+  Len := Length(Texto);
+  SetLength(Result, Len);
+  J := 0;
+  NoEspaco := False;
+  for I := 1 to Len do
+  begin
+    if CharInSet(Texto[I], [#1..#32]) then
+    begin
+      if not NoEspaco then
+      begin
+        Inc(J);
+        Result[J] := ' ';
+        NoEspaco := True;
+      end;
+    end
+    else
+    begin
+      Inc(J);
+      Result[J] := Texto[I];
+      NoEspaco := False;
+    end;
+  end;
+  SetLength(Result, J);
+  Result := Trim(Result);
+end;
+
+function FormatarPropriedade(const S: string): string;
+var
+  LowerS, Base: string;
+  MinIdx, Idx: Integer;
+
+  procedure CheckKeyword(const Kw: string);
+  begin
+    Idx := Pos(Kw, LowerS);
+    if (Idx > 0) and (Idx < MinIdx) then MinIdx := Idx;
+  end;
+begin
+  Base := S;
+  LowerS := LowerCase(Base);
+  if LowerS.StartsWith('property ') then
+    Base := Trim(Copy(Base, 10, MaxInt));
+
+  LowerS := LowerCase(Base);
+  MinIdx := MaxInt;
+  CheckKeyword(' read ');
+  CheckKeyword(' write ');
+  CheckKeyword(' default ');
+  CheckKeyword(' nodefault ');
+  CheckKeyword(' stored ');
+  CheckKeyword(' implements ');
+  CheckKeyword(' readonly ');
+  CheckKeyword(' index ');
+
+  if MinIdx < MaxInt then
+    Result := Trim(Copy(Base, 1, MinIdx - 1))
+  else
+    Result := Base;
+end;
+
+function FormatarMetodo(const S: string): string;
+var
+  LowerS: string;
+begin
+  LowerS := LowerCase(S);
+  if LowerS.StartsWith('procedure ') then Result := Trim(Copy(S, 11, MaxInt))
+  else if LowerS.StartsWith('function ') then Result := Trim(Copy(S, 10, MaxInt))
+  else if LowerS.StartsWith('constructor ') then Result := Trim(Copy(S, 13, MaxInt))
+  else if LowerS.StartsWith('destructor ') then Result := Trim(Copy(S, 12, MaxInt))
+  else if LowerS.StartsWith('class procedure ') then Result := Trim(Copy(S, 17, MaxInt))
+  else if LowerS.StartsWith('class function ') then Result := Trim(Copy(S, 16, MaxInt))
+  else Result := S;
+end;
+
+procedure QuickSortItens(var A: TArray<TItemRecord>; L, R: Integer);
+var
+  I, J: Integer;
+  Pivot, Temp: TItemRecord;
+  Comp: Integer;
+begin
+  if L >= R then Exit;
+  I := L; J := R;
+  Pivot := A[(L + R) div 2];
+  repeat
+    repeat
+      Comp := A[I].Tipo - Pivot.Tipo;
+      if Comp = 0 then Comp := CompareText(A[I].Utilizavel, Pivot.Utilizavel);
+      if Comp < 0 then Inc(I) else Break;
+    until False;
+    repeat
+      Comp := A[J].Tipo - Pivot.Tipo;
+      if Comp = 0 then Comp := CompareText(A[J].Utilizavel, Pivot.Utilizavel);
+      if Comp > 0 then Dec(J) else Break;
+    until False;
+    if I <= J then
+    begin
+      Temp := A[I]; A[I] := A[J]; A[J] := Temp;
+      Inc(I); Dec(J);
+    end;
+  until I > J;
+  if L < J then QuickSortItens(A, L, J);
+  if I < R then QuickSortItens(A, I, R);
+end;
+
+function GetLineText(const BufferText: string; LineNum: Integer): string;
+var
+  P, PStart: PChar;
+  CurLine: Integer;
+begin
+  Result  := '';
+  CurLine := 1;
+  P       := PChar(BufferText);
+  while P^ <> #0 do
+  begin
+    if CurLine = LineNum then
+    begin
+      PStart := P;
+      while (P^ <> #0) and (P^ <> #10) and (P^ <> #13) do Inc(P);
+      SetString(Result, PStart, P - PStart);
+      Exit;
+    end;
+    if P^ = #10 then Inc(CurLine);
+    Inc(P);
+  end;
+end;
+
+function CompareMember(const A, B: TSymbolInfo): Integer;
+begin
+  if A.InheritDepth <> B.InheritDepth then
+    Exit(A.InheritDepth - B.InheritDepth);
+  if (A.InheritDepth = 0) and (A.Line > 0) and (B.Line > 0) then
+    Exit(A.Line - B.Line);
+  Result := CompareText(A.Name, B.Name);
+end;
+
+procedure QuickSortMembers(var A: TArray<TSymbolInfo>; L, R: Integer);
+var
+  I, J: Integer;
+  Pivot: TSymbolInfo;
+  Temp: TSymbolInfo;
+begin
+  if L >= R then Exit;
+  I := L;
+  J := R;
+  Pivot := A[(L + R) div 2];
+  repeat
+    while CompareMember(A[I], Pivot) < 0 do Inc(I);
+    while CompareMember(A[J], Pivot) > 0 do Dec(J);
+    if I <= J then
+    begin
+      Temp := A[I];
+      A[I] := A[J];
+      A[J] := Temp;
+      Inc(I);
+      Dec(J);
+    end;
+  until I > J;
+  if L < J then QuickSortMembers(A, L, J);
+  if I < R then QuickSortMembers(A, I, R);
+end;
+
+procedure QuickSortByMode(var A: TArray<TItemRecord>; L, R: Integer; Mode: Integer);
+var
+  I, J: Integer;
+  Pivot, Temp: TItemRecord;
+  Comp: Integer;
+begin
+  if L >= R then Exit;
+  I := L;
+  J := R;
+  Pivot := A[(L + R) div 2];
+  repeat
+    while True do
+    begin
+      if Mode = 1 then Comp := CompareText(A[I].Utilizavel, Pivot.Utilizavel)
+      else if Mode = 2 then Comp := CompareText(Pivot.Utilizavel, A[I].Utilizavel)
+      else if Mode = 3 then
+      begin
+        Comp := A[I].Tipo - Pivot.Tipo;
+        if Comp = 0 then Comp := CompareText(A[I].Utilizavel, Pivot.Utilizavel);
+      end
+      else Comp := 0;
+      if Comp < 0 then Inc(I) else Break;
+    end;
+
+    while True do
+    begin
+      if Mode = 1 then Comp := CompareText(A[J].Utilizavel, Pivot.Utilizavel)
+      else if Mode = 2 then Comp := CompareText(Pivot.Utilizavel, A[J].Utilizavel)
+      else if Mode = 3 then
+      begin
+        Comp := A[J].Tipo - Pivot.Tipo;
+        if Comp = 0 then Comp := CompareText(A[J].Utilizavel, Pivot.Utilizavel);
+      end
+      else Comp := 0;
+      if Comp > 0 then Dec(J) else Break;
+    end;
+
+    if I <= J then
+    begin
+      Temp := A[I];
+      A[I] := A[J];
+      A[J] := Temp;
+      Inc(I);
+      Dec(J);
+    end;
+  until I > J;
+  if L < J then QuickSortByMode(A, L, J, Mode);
+  if I < R then QuickSortByMode(A, I, R, Mode);
+end;
+
+procedure TEditorPopup.CarregarItensLista(Members: TArray<TSymbolInfo>);
+var
+  I, MaxW, W: Integer;
+begin
+  FIsMemberListMode := True;
+  FCellH := 24;
+  if Length(Members) > 0 then QuickSortMembers(Members, 0, High(Members));
+  SetLength(FItems, Length(Members));
+  for I := 0 to High(Members) do
+  begin
+    FItems[I].Utilizavel := Members[I].Name;
+    case Members[I].Kind of
+      skProperty:
+      begin
+        FItems[I].Tipo := 0;
+        FItems[I].Visual := FormatarPropriedade(LimparEspacos(Members[I].Signature));
+      end;
+      skMethod:
+      begin
+        if Members[I].DataType <> '' then FItems[I].Tipo := 2
+        else FItems[I].Tipo := 1;
+        FItems[I].Visual := FormatarMetodo(LimparEspacos(Members[I].Signature));
+      end;
+      skVar:
+      begin
+        FItems[I].Tipo := 3;
+        FItems[I].Visual := LimparEspacos(Members[I].Signature);
+      end;
+      skType:
+      begin
+        FItems[I].Tipo := 4;
+        FItems[I].Visual := LimparEspacos(Members[I].Signature);
+      end;
+      skConst:
+      begin
+        FItems[I].Tipo := 5;
+        FItems[I].Visual := LimparEspacos(Members[I].Signature);
+      end;
+    end;
+  end;
+
+  SetLength(FAllItems, Length(FItems));
+  for I := 0 to High(FItems) do FAllItems[I] := FItems[I];
+
+  FRows := Length(FItems);
+  FTopRow := 0;
+  if FRows > 0 then FSelectedRow := 0 else FSelectedRow := -1;
+  Canvas.Font.Name := 'Consolas';
+  Canvas.Font.Size := 10;
+  Canvas.Font.Style := [fsBold];
+  MaxW := 0;
+  for I := 0 to Length(FItems) - 1 do
+  begin
+    W := Canvas.TextWidth(FItems[I].Visual) + FTypeColW;
+    if W > MaxW then MaxW := W;
+  end;
+  Inc(MaxW, 20);
+  if MaxW > Width then
+  begin
+    if MaxW > 600 then Width := 600 else Width := MaxW;
+  end;
+  Invalidate;
+end;
+
+procedure TEditorPopup.CarregarItensGrid(const CaminhoArquivo: string);
+var
+  Extrato: TExtratoUnit;
+  I, Total, MaxW, W: Integer;
+begin
+  FIsMemberListMode := False;
+  FCellH := 24;
+  Extrato := ProcessarArquivoDelphi(CaminhoArquivo);
+  Total := 0;
+  for I := 0 to High(Extrato.Metodos) do
+    if Extrato.Metodos[I].TipoNome = '' then Inc(Total);
+  for I := 0 to High(Extrato.Variaveis) do
+    if Extrato.Variaveis[I].TipoNome = '' then Inc(Total);
+  Inc(Total, Length(Extrato.Tipos));
+  Inc(Total, Length(Extrato.Constantes));
+
+  SetLength(FItems, Total);
+  Total := 0;
+  for I := 0 to High(Extrato.Metodos) do
+  begin
+    if Extrato.Metodos[I].TipoNome <> '' then Continue;
+    FItems[Total] := Extrato.Metodos[I];
+    FItems[Total].Visual := FormatarMetodo(LimparEspacos(FItems[Total].Visual));
+    Inc(Total);
+  end;
+  for I := 0 to High(Extrato.Variaveis) do
+  begin
+    if Extrato.Variaveis[I].TipoNome <> '' then Continue;
+    FItems[Total] := Extrato.Variaveis[I];
+    FItems[Total].Visual := LimparEspacos(FItems[Total].Visual);
+    Inc(Total);
+  end;
+  for I := 0 to High(Extrato.Tipos) do
+  begin
+    FItems[Total] := Extrato.Tipos[I];
+    FItems[Total].Visual := LimparEspacos(FItems[Total].Visual);
+    Inc(Total);
+  end;
+  for I := 0 to High(Extrato.Constantes) do
+  begin
+    FItems[Total] := Extrato.Constantes[I];
+    FItems[Total].Visual := LimparEspacos(FItems[Total].Visual);
+    Inc(Total);
+  end;
+
+  if Total > 0 then QuickSortItens(FItems, 0, Total - 1);
+
+  SetLength(FAllItems, Total);
+  for I := 0 to Total - 1 do FAllItems[I] := FItems[I];
+
+  FRows := Total;
+  FTopRow := 0;
+  if FRows > 0 then FSelectedRow := 0 else FSelectedRow := -1;
+  Canvas.Font.Name := 'Consolas';
+  Canvas.Font.Size := 10;
+  Canvas.Font.Style := [fsBold];
+  MaxW := 0;
+  for I := 0 to Total - 1 do
+  begin
+    W := Canvas.TextWidth(FItems[I].Visual) + FTypeColW;
+    if W > MaxW then MaxW := W;
+  end;
+  Inc(MaxW, 20);
+  if MaxW > Width then
+  begin
+    if MaxW > 600 then Width := 600 else Width := MaxW;
+  end;
+  Invalidate;
+end;
+
+procedure TEditorPopup.ApplyFilter(const FilterText: string);
+var
+  I, Count: Integer;
+  UpperFilter: string;
+begin
+  SetLength(FItems, Length(FAllItems));
+  Count := 0;
+  UpperFilter := UpperCase(FilterText);
+
+  for I := 0 to High(FAllItems) do
+  begin
+    if (FilterText = '') or (Pos(UpperFilter, UpperCase(FAllItems[I].Utilizavel)) > 0) then
+    begin
+      FItems[Count] := FAllItems[I];
+      Inc(Count);
+    end;
+  end;
+
+  if (Count > 0) and (FFilterMode > 0) then
+    QuickSortByMode(FItems, 0, Count - 1, FFilterMode);
+
+  SetLength(FItems, Count);
+  FRows := Count;
+  FSelectedRow := -1;
+  if FRows > 0 then FSelectedRow := 0;
+
+  EnsureVisible;
+  Invalidate;
+end;
+
+procedure TEditorPopup.EnsureVisible;
+var
+  VisibleRows: Integer;
+begin
+  if FSelectedRow < 0 then Exit;
+  VisibleRows := (Height - FTrapHeight - FTitleHeight - FFooterHeight) div FCellH;
+  if FSelectedRow < FTopRow then FTopRow := FSelectedRow
+  else if FSelectedRow >= FTopRow + VisibleRows then FTopRow := FSelectedRow - VisibleRows + 1;
+  if FTopRow < 0 then FTopRow := 0;
+end;
+
+function TEditorPopup.GetThumbRect(out ARect: TRect): Boolean;
+var
+  VisibleRows, ScrollAreaH, ThumbH, MaxThumbTop, ThumbTop: Integer;
+begin
+  ScrollAreaH := Height - FTrapHeight - FTitleHeight - FFooterHeight;
+  VisibleRows := ScrollAreaH div FCellH;
+  if FRows <= VisibleRows then Exit(False);
+  ThumbH := Round((VisibleRows / FRows) * ScrollAreaH);
+  if ThumbH < 20 then ThumbH := 20;
+  MaxThumbTop := ScrollAreaH - ThumbH;
+  if FRows - VisibleRows > 0 then ThumbTop := FTrapHeight + FTitleHeight + Round((FTopRow / (FRows - VisibleRows)) * MaxThumbTop)
+  else ThumbTop := FTrapHeight + FTitleHeight;
+  ARect := Rect(Width - 10, ThumbTop, Width, ThumbTop + ThumbH);
+  Result := True;
+end;
+
+procedure TEditorPopup.WMEraseBkgnd(var Msg: TWMEraseBkgnd);
+begin
+  Msg.Result := 1;
+end;
+
+procedure TEditorPopup.WMNCHitTest(var Msg: TWMNCHitTest);
+const
+  BorderWidth = 5;
+var
+  P: TPoint;
+begin
+  inherited;
+  P := ScreenToClient(Point(Msg.XPos, Msg.YPos));
+  if (P.X < BorderWidth) and (P.Y < FTrapHeight + BorderWidth) then Msg.Result := HTTOPLEFT
+  else if (P.X > Width - BorderWidth) and (P.Y < FTrapHeight + BorderWidth) then Msg.Result := HTTOPRIGHT
+  else if (P.X < BorderWidth) and (P.Y > Height - BorderWidth) then Msg.Result := HTBOTTOMLEFT
+  else if (P.X > Width - BorderWidth) and (P.Y > Height - BorderWidth) then Msg.Result := HTBOTTOMRIGHT
+  else if (P.X < BorderWidth) then Msg.Result := HTLEFT
+  else if (P.X > Width - BorderWidth) then Msg.Result := HTRIGHT
+  else if P.Y < FTrapHeight + BorderWidth then Msg.Result := HTTOP
+  else if P.Y > Height - BorderWidth then Msg.Result := HTBOTTOM;
+end;
+
+procedure TEditorPopup.Resize;
+begin
+  inherited;
+  UpdateRegion;
+  EnsureVisible;
+  Invalidate;
+end;
+
+procedure TEditorPopup.Paint;
+var
+  R, DrawY, VisibleRows, ScrollW, ScrollAreaH, GridTop, TrapW: Integer;
+  CellRect, ThumbRect: TRect;
+  StrTipo, FilterName: string;
+  BaseFontColor: TColor;
+begin
+  Canvas.Lock;
+  try
+    Canvas.Brush.Color := $002B2B2B;
+    Canvas.FillRect(Rect(0, FTrapHeight, Width, Height));
+    Canvas.Brush.Color := $00A36215;
+    Canvas.FillRect(Rect(0, FTrapHeight, Width, FTrapHeight + FTitleHeight));
+
+    Canvas.Font.Name  := 'Consolas';
+    Canvas.Font.Size  := 12;
+    Canvas.Font.Color := clWhite;
+    Canvas.Font.Style := [fsBold];
+    Canvas.TextOut(8, FTrapHeight + (FTitleHeight - Canvas.TextHeight('CS Code Insight')) div 2, 'CS Code Insight');
+
+    if FObservedType <> '' then
+    begin
+      Canvas.Font.Style := [];
+      Canvas.Font.Color := $00E0E0E0;
+      Canvas.TextOut(Width - Canvas.TextWidth(FObservedType) - 8, FTrapHeight + (FTitleHeight - Canvas.TextHeight(FObservedType)) div 2, FObservedType);
+    end;
+
+    GridTop := FTrapHeight + FTitleHeight;
+    ScrollAreaH := Height - GridTop - FFooterHeight;
+    VisibleRows := (ScrollAreaH div FCellH) + 1;
+    if (FRows > (ScrollAreaH div FCellH)) then ScrollW := 10 else ScrollW := 0;
+
+    Canvas.Font.Size  := 10;
+    Canvas.Font.Style := [];
+
+    for R := FTopRow to FTopRow + VisibleRows do
+    begin
+      if R >= FRows then Break;
+      DrawY := GridTop + (R - FTopRow) * FCellH;
+      if DrawY >= Height - FFooterHeight then Break;
+      CellRect := TRect.Create(1, DrawY, Width - 1 - ScrollW, DrawY + FCellH);
+      if R = FSelectedRow then
+      begin
+        Canvas.Brush.Color := $00604A31;
+        BaseFontColor := clWhite;
+        Canvas.Font.Style := [fsBold];
+      end
+      else
+      begin
+        Canvas.Brush.Color := $002B2B2B;
+        BaseFontColor := $00E0E0E0;
+        Canvas.Font.Style := [];
+      end;
+      Canvas.FillRect(CellRect);
+      Canvas.Brush.Style := bsClear;
+      if R < Length(FItems) then
+      begin
+        case FItems[R].Tipo of
+          0: StrTipo := 'property';
+          1: StrTipo := 'procedure';
+          2: StrTipo := 'function';
+          3: StrTipo := 'var';
+          4: StrTipo := 'type';
+          5: StrTipo := 'const';
+          else StrTipo := '';
+        end;
+        Canvas.Font.Color := FColorTypeCol;
+        Canvas.TextOut(CellRect.Left + 8, CellRect.Top + 4, StrTipo);
+        Canvas.Pen.Color := $00404040;
+        Canvas.MoveTo(CellRect.Left + FTypeColW - 6, CellRect.Top + 2);
+        Canvas.LineTo(CellRect.Left + FTypeColW - 6, CellRect.Bottom - 2);
+        DrawSyntaxHighlight(Canvas, CellRect.Left + FTypeColW, CellRect.Top + 4, FItems[R].Visual, FItems[R].Utilizavel, FItems[R].Tipo, BaseFontColor, FColorNumber, FColorType, FColorReturn, FColorKeyword, R = FSelectedRow, FLastTypedText);
+      end;
+    end;
+
+    if ScrollW > 0 then
+    begin
+      Canvas.Brush.Color := $002B2B2B;
+      Canvas.FillRect(Rect(Width - 10, GridTop, Width, Height - FFooterHeight));
+      if GetThumbRect(ThumbRect) then
+      begin
+        Canvas.Brush.Color := $00555555;
+        Canvas.FillRect(ThumbRect);
+      end;
+    end;
+
+    Canvas.Brush.Color := $002B2B2B;
+    Canvas.FillRect(Rect(0, Height - FFooterHeight, Width, Height));
+    Canvas.Pen.Color := $00404040;
+    Canvas.MoveTo(0, Height - FFooterHeight);
+    Canvas.LineTo(Width, Height - FFooterHeight);
+    Canvas.Font.Name := 'Consolas';
+    Canvas.Font.Size := 8;
+    Canvas.Font.Color := $00808080;
+    Canvas.Font.Style := [];
+    Canvas.Brush.Style := bsClear;
+    Canvas.TextOut(8, Height - FFooterHeight + ((FFooterHeight - Canvas.TextHeight('S')) div 2), 'Shift + Tab para ativar os filtros');
+
+    TrapW := GetTrapWidth;
+    if FFilterMode > 0 then
+    begin
+      Canvas.Brush.Color := $002B2B2B;
+      Canvas.Pen.Style := psClear;
+      Canvas.Polygon([Point(Width - TrapW + 12, 0), Point(Width, 0), Point(Width, FTrapHeight), Point(Width - TrapW, FTrapHeight)]);
+      Canvas.Pen.Style := psSolid;
+
+      Canvas.Font.Name := 'Consolas';
+      Canvas.Font.Size := 9;
+      Canvas.Font.Color := $00E0E0E0;
+      Canvas.Font.Style := [fsItalic];
+      Canvas.Brush.Style := bsClear;
+
+      FilterName := '';
+      case FFilterMode of
+        1: FilterName := 'A-Z';
+        2: FilterName := 'Z-A';
+        3: FilterName := 'Keywords';
+      end;
+
+      Canvas.TextOut(Width - TrapW + 18, 2, 'filtro: ' + FilterName);
+    end;
+
+    Canvas.Pen.Color := $00A36215;
+    Canvas.Pen.Width := 1;
+    Canvas.Brush.Style := bsClear;
+
+    Canvas.MoveTo(0, FTrapHeight);
+    Canvas.LineTo(0, Height - 1);
+    Canvas.LineTo(Width - 1, Height - 1);
+    Canvas.LineTo(Width - 1, FTrapHeight);
+
+    if FFilterMode > 0 then
+    begin
+      Canvas.LineTo(Width - 1, 0);
+      Canvas.LineTo(Width - TrapW + 12, 0);
+      Canvas.LineTo(Width - TrapW, FTrapHeight);
+      Canvas.LineTo(0, FTrapHeight);
+    end
+    else
+    begin
+      Canvas.LineTo(0, FTrapHeight);
+    end;
+  finally
+    Canvas.Unlock;
+  end;
+end;
+
+procedure TEditorPopup.MouseMove(Shift: TShiftState; X, Y: Integer);
+var
+  HoverRow: Integer;
+  OldRow: Integer;
+  VisibleRows, ScrollAreaH, ThumbH, MaxThumbTop, GridTop: Integer;
+  ScrollRatio: Double;
+begin
+  GridTop := FTrapHeight + FTitleHeight;
+  ScrollAreaH := Height - GridTop - FFooterHeight;
+  if FIsDraggingScroll then
+  begin
+    VisibleRows := ScrollAreaH div FCellH;
+    if FRows > VisibleRows then
+    begin
+      ThumbH := Round((VisibleRows / FRows) * ScrollAreaH);
+      if ThumbH < 20 then ThumbH := 20;
+      MaxThumbTop := ScrollAreaH - ThumbH;
+      if MaxThumbTop > 0 then
+      begin
+        ScrollRatio := (Y - FDragOffset - GridTop) / MaxThumbTop;
+        FTopRow := Round(ScrollRatio * (FRows - VisibleRows));
+        if FTopRow < 0 then FTopRow := 0;
+        if FTopRow > FRows - VisibleRows then FTopRow := FRows - VisibleRows;
+        Invalidate;
+      end;
+    end;
+    Exit;
+  end;
+  OldRow := FSelectedRow;
+  if (X < Width - 10) or (FRows <= (ScrollAreaH div FCellH)) then
+  begin
+    if (Y > GridTop) and (Y < Height - FFooterHeight) then
+    begin
+      HoverRow := FTopRow + ((Y - GridTop) div FCellH);
+      if HoverRow < FRows then FSelectedRow := HoverRow
+      else FSelectedRow := -1;
+    end
+    else FSelectedRow := -1;
+  end
+  else FSelectedRow := -1;
+  if OldRow <> FSelectedRow then Invalidate;
+end;
+
+function TEditorPopup.DoMouseWheel(Shift: TShiftState; WheelDelta: Integer; MousePos: TPoint): Boolean;
+var
+  MaxTopRow: Integer;
+begin
+  Result := inherited;
+  MaxTopRow := FRows - ((Height - FTrapHeight - FTitleHeight - FFooterHeight) div FCellH);
+  if MaxTopRow < 0 then MaxTopRow := 0;
+  if WheelDelta > 0 then
+  begin
+    if FTopRow > 0 then Dec(FTopRow);
+  end
+  else
+  begin
+    if FTopRow < MaxTopRow then Inc(FTopRow);
+  end;
+  Invalidate;
+end;
+
+procedure TEditorPopup.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
+var
+  ThumbRect: TRect;
+  MaxTopRow, ClickRow: Integer;
+begin
+  inherited;
+  if Button <> mbLeft then Exit;
+  if GetThumbRect(ThumbRect) then
+  begin
+    if PtInRect(ThumbRect, Point(X, Y)) then
+    begin
+      FIsDraggingScroll := True;
+      FDragOffset := Y - ThumbRect.Top;
+      Exit;
+    end;
+    if X >= Width - 10 then
+    begin
+      MaxTopRow := FRows - ((Height - FTrapHeight - FTitleHeight - FFooterHeight) div FCellH);
+      if MaxTopRow < 0 then MaxTopRow := 0;
+      if Y < ThumbRect.Top then
+        FTopRow := FTopRow - 5
+      else
+        FTopRow := FTopRow + 5;
+      if FTopRow < 0 then FTopRow := 0;
+      if FTopRow > MaxTopRow then FTopRow := MaxTopRow;
+      Invalidate;
+      Exit;
+    end;
+  end;
+  ClickRow := FTopRow + (Y - FTrapHeight - FTitleHeight) div FCellH;
+  if (ClickRow >= 0) and (ClickRow < FRows) then
+  begin
+    FSelectedRow := ClickRow;
+    Invalidate;
+    InsertSelectedText;
+  end
+  else
+    Hide;
+end;
+
+procedure TEditorPopup.MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
+begin
+  inherited;
+  FIsDraggingScroll := False;
+end;
+
+procedure TEditorPopup.Deactivate;
+begin
+  inherited;
+  Hide;
+end;
+
+procedure TEditorPopup.ShowAtPos(X, Y: Integer);
+begin
+  EnsureVisible;
+  SetBounds(X, Y, Width, Height);
+  ShowWindow(Handle, SW_SHOWNOACTIVATE);
+  Visible := True;
+  UpdateRegion;
+end;
+
+function ParseParamNames(const Visual: string): TArray<string>;
+var
+  P         : PChar;
+  Depth     : Integer;
+  ParamSection : string;
+  Groups, Parts : TArray<string>;
+  Group, Part, T: string;
+  Count     : Integer;
+  Names     : TArray<string>;
+
+  procedure AddName(const S: string);
+  var N: string;
+  begin
+    N := Trim(S);
+    if N = '' then Exit;
+    if SameText(N, 'const') or SameText(N, 'var') or
+       SameText(N, 'out')   or SameText(N, 'array') then Exit;
+    if Count >= Length(Names) then SetLength(Names, Length(Names) + 8);
+    Names[Count] := N;
+    Inc(Count);
+  end;
+
+begin
+  SetLength(Result, 0);
+  Count := 0;
+  SetLength(Names, 16);
+
+  P := PChar(Visual);
+  while (P^ <> #0) and (P^ <> '(') do Inc(P);
+  if P^ <> '(' then Exit;
+  Inc(P);
+
+  Depth := 1;
+  ParamSection := '';
+  while (P^ <> #0) and (Depth > 0) do
+  begin
+    case P^ of
+      '(': Inc(Depth);
+      '<': Inc(Depth);
+      ')': Dec(Depth);
+      '>': if Depth > 1 then Dec(Depth);
+    end;
+    if Depth > 0 then ParamSection := ParamSection + P^;
+    Inc(P);
+  end;
+
+  if ParamSection = '' then Exit;
+
+  Groups := ParamSection.Split([';']);
+  for Group in Groups do
+  begin
+    var ColonIdx := Group.IndexOf(':');
+    var NamesStr: string;
+    if ColonIdx >= 0 then
+      NamesStr := Copy(Group, 1, ColonIdx)
+    else
+      NamesStr := Group;
+
+    Parts := NamesStr.Split([',']);
+    for Part in Parts do
+    begin
+      T := Trim(Part);
+      if T.StartsWith('const ') then T := Trim(Copy(T, 7, MaxInt));
+      if T.StartsWith('var ')   then T := Trim(Copy(T, 5, MaxInt));
+      if T.StartsWith('out ')   then T := Trim(Copy(T, 5, MaxInt));
+      AddName(T);
+    end;
+  end;
+
+  SetLength(Names, Count);
+  Result := Names;
+end;
+
+function ExtractParamString(const Visual: string): string;
+var
+  P, StartP, EndP: PChar;
+  Depth: Integer;
+begin
+  Result := '';
+  P := PChar(Visual);
+  while (P^ <> #0) and (P^ <> '(') do Inc(P);
+  if P^ <> '(' then Exit;
+  Inc(P);
+  StartP := P;
+  Depth := 1;
+  while (P^ <> #0) and (Depth > 0) do
+  begin
+    if P^ = '(' then Inc(Depth)
+    else if P^ = ')' then Dec(Depth);
+    if Depth = 0 then
+    begin
+      EndP := P;
+      SetString(Result, StartP, EndP - StartP);
+      Exit;
+    end;
+    Inc(P);
+  end;
+end;
+
+function ExtractExpressionEx(const S: AnsiString; StartPos: Integer; out IsArray: Boolean): string;
+var
+  I, EndPos: Integer;
+  ParenDepth, BracketDepth: Integer;
+begin
+  IsArray := False;
+  I := StartPos;
+  while (I > 0) and CharInSet(Char(S[I]), [' ', #9]) do Dec(I);
+
+  if (I > 0) and (S[I] = ']') then IsArray := True;
+
+  EndPos := I;
+  ParenDepth := 0;
+  BracketDepth := 0;
+
+  while I > 0 do
+  begin
+    if S[I] = ')' then Inc(ParenDepth)
+    else if S[I] = '(' then Dec(ParenDepth)
+    else if S[I] = ']' then Inc(BracketDepth)
+    else if S[I] = '[' then Dec(BracketDepth);
+
+    if (ParenDepth = 0) and (BracketDepth = 0) then
+    begin
+      if not CharInSet(Char(S[I]), ['a'..'z', 'A'..'Z', '0'..'9', '_', '.', '[', ']', '(', ')', '''', '"']) then
+        Break;
+    end;
+
+    if (ParenDepth < 0) or (BracketDepth < 0) then
+    begin
+      Break;
+    end;
+
+    Dec(I);
+  end;
+
+  if EndPos > I then Result := string(Copy(S, I + 1, EndPos - I))
+  else Result := '';
+end;
+
+function SplitExpression(const Expr: string): TArray<string>;
+var
+  I, StartIdx, Len, ParenDepth, BracketDepth: Integer;
+  List: TStringList;
+begin
+  List := TStringList.Create;
+  try
+    ParenDepth := 0;
+    BracketDepth := 0;
+    StartIdx := 1;
+    Len := Length(Expr);
+
+    for I := 1 to Len do
+    begin
+      if Expr[I] = '(' then Inc(ParenDepth)
+      else if Expr[I] = ')' then Dec(ParenDepth)
+      else if Expr[I] = '[' then Inc(BracketDepth)
+      else if Expr[I] = ']' then Dec(BracketDepth)
+      else if Expr[I] = '.' then
+      begin
+        if (ParenDepth <= 0) and (BracketDepth <= 0) then
+        begin
+          List.Add(Copy(Expr, StartIdx, I - StartIdx));
+          StartIdx := I + 1;
+        end;
+      end;
+    end;
+
+    if StartIdx <= Len then
+      List.Add(Copy(Expr, StartIdx, Len - StartIdx + 1));
+
+    SetLength(Result, List.Count);
+    for I := 0 to List.Count - 1 do
+      Result[I] := List[I];
+  finally
+    List.Free;
+  end;
+end;
+
+procedure TEditorPopup.InsertSelectedText;
+var
+  EditSvc   : IOTAEditorServices;
+  EditView  : IOTAEditView;
+  EditPos   : IOTAEditPosition;
+  Texto     : string;
+  Params    : TArray<string>;
+  Template  : string;
+  I         : Integer;
+  Content   : string;
+  CaretLinear: Integer;
+  CaretPt   : TPoint;
+  EdHandle  : HWND;
+  CharsToDelete: Integer;
+begin
+  if (FSelectedRow < 0) or (FSelectedRow >= Length(FItems)) then Exit;
+  if (FItems[FSelectedRow].Utilizavel = '') or
+     (FItems[FSelectedRow].Utilizavel[1] = '/') then Exit;
+
+  if BorlandIDEServices.QueryInterface(IOTAEditorServices, EditSvc) <> S_OK then Exit;
+  EditView := EditSvc.TopView;
+  if not Assigned(EditView) then Exit;
+
+  EditPos := EditView.Position;
+
+  if GHintActive then
+  begin
+    GHintActive := False;
+    if Assigned(GParamHintForm) then GParamHintForm.Hide;
+  end;
+
+  if FTypedStartCol > 0 then
+  begin
+    CharsToDelete := EditPos.Column - FTypedStartCol;
+    if CharsToDelete > 0 then
+    begin
+      EditPos.Move(EditPos.Row, FTypedStartCol);
+      EditPos.Delete(CharsToDelete);
+    end;
+  end;
+
+  if (FItems[FSelectedRow].Tipo in [1, 2]) then
+  begin
+    Params := ParseParamNames(FItems[FSelectedRow].Visual);
+    if Length(Params) > 0 then
+    begin
+      if GInsertParamsStr then
+      begin
+        Template := FItems[FSelectedRow].Utilizavel + '(';
+        for I := 0 to High(Params) do
+        begin
+          Template := Template + Params[I];
+          if I < High(Params) then Template := Template + ', ';
+        end;
+        Template := Template + ')';
+        EditPos.InsertText(Template);
+
+        Content := LerBufferEditor(EditView.Buffer);
+        CaretLinear := RowColToLinearPos(Content, EditView.CursorPos.Line, EditView.CursorPos.Col);
+
+        GTemplateZoneEnd := CaretLinear - 1;
+        GTemplateSearchFrom := CaretLinear - Length(Template) + Length(FItems[FSelectedRow].Utilizavel) + 1;
+        GTemplateActive := True;
+        GTemplateParams := Params;
+        GTemplateParamIdx := 0;
+
+        FindAndSelectNextParam(EditView);
+
+        EditView.Paint;
+        Hide;
+        Exit;
+      end
+      else
+      begin
+        Template := FItems[FSelectedRow].Utilizavel + '()';
+        EditPos.InsertText(Template);
+        EditPos.Move(EditPos.Row, EditPos.Column - 1);
+        EditView.Paint;
+
+        Texto := ExtractParamString(FItems[FSelectedRow].Visual);
+
+        Content := LerBufferEditor(EditView.Buffer);
+        CaretLinear := RowColToLinearPos(Content, EditView.CursorPos.Line, EditView.CursorPos.Col);
+        GHintLinearStart := CaretLinear - 1;
+
+        EdHandle := GetFocus;
+        if EdHandle = 0 then EdHandle := FEditorHandle;
+
+        if (EdHandle <> 0) and Winapi.Windows.GetCaretPos(CaretPt) then
+        begin
+          Winapi.Windows.ClientToScreen(EdHandle, CaretPt);
+          GParamHintForm.ShowHint(CaretPt.X, CaretPt.Y, Texto);
+
+          GHintActive := True;
+          GHintEditView := EditView;
+          GHintTimer.Enabled := False;
+          GHintTimer.Enabled := True;
+        end;
+
+        Hide;
+        Exit;
+      end;
+    end;
+  end;
+
+  Texto := FItems[FSelectedRow].Utilizavel;
+  EditPos.InsertText(Texto);
+  EditView.Paint;
+  Hide;
+end;
+
+
+function FindCurrentClassContext(const BufferText: string; LineNum: Integer): string;
+var
+  Lines: TArray<string>;
+  I: Integer;
+  P, StartP: PChar;
+  Tok: string;
+begin
+  Result := '';
+  Lines := BufferText.Split([#10]);
+  for I := LineNum - 1 downto 0 do
+  begin
+    if I > High(Lines) then Continue;
+    P := PChar(Lines[I]);
+    while CharInSet(P^, [' ', #9]) do Inc(P);
+
+    if (StrLIComp(P, 'procedure', 9) = 0) then Inc(P, 9)
+    else if (StrLIComp(P, 'function', 8) = 0) then Inc(P, 8)
+    else if (StrLIComp(P, 'constructor', 11) = 0) then Inc(P, 11)
+    else if (StrLIComp(P, 'destructor', 10) = 0) then Inc(P, 10)
+    else Continue;
+
+    while CharInSet(P^, [' ', #9]) do Inc(P);
+
+    StartP := P;
+    while CharInSet(P^, ['a'..'z', 'A'..'Z', '0'..'9', '_']) do Inc(P);
+    SetString(Tok, StartP, P - StartP);
+
+    if P^ = '.' then
+    begin
+      Result := Tok;
+      Exit;
+    end;
+  end;
+end;
+
+
+function ExtractBaseType(const AType: string): string;
+var
+  LowerType: string;
+  Idx, Idx2: Integer;
+begin
+  Result := AType;
+  LowerType := LowerCase(Result);
+  if Pos('tarray<', LowerType) > 0 then
+  begin
+    Idx := Pos('<', Result);
+    Idx2 := LastDelimiter('>', Result);
+    if (Idx > 0) and (Idx2 > Idx) then
+      Result := Copy(Result, Idx + 1, Idx2 - Idx - 1);
+  end
+  else if Pos('array of ', LowerType) > 0 then
+  begin
+    Idx := Pos('array of ', LowerType);
+    Result := Trim(Copy(Result, Idx + 9, MaxInt));
+  end
+  else if Pos('set of ', LowerType) > 0 then
+  begin
+    Idx := Pos('set of ', LowerType);
+    Result := Trim(Copy(Result, Idx + 7, MaxInt));
+  end;
+end;
+
+
+function QuickLookupInBuffer(const BufferText, VarName: string; ContextLine: Integer): string;
+
+  function IsMethodKeyword(const T: string): Boolean;
+  begin
+    Result := SameText(T,'procedure') or SameText(T,'function') or
+              SameText(T,'constructor') or SameText(T,'destructor');
+  end;
+
+  function IsLocalMethodDecl(const Line: string): Boolean;
+  var
+    I, Len: Integer;
+    Tok: string;
+    PL: PChar;
+  begin
+    Result := False;
+    PL := PChar(Trim(Line));
+    if not CharInSet(PL^, ['a'..'z','A'..'Z','_']) then Exit;
+    var PS := PL;
+    while CharInSet(PL^, ['a'..'z','A'..'Z','0'..'9','_']) do Inc(PL);
+    SetString(Tok, PS, PL - PS);
+    if not IsMethodKeyword(Tok) then Exit;
+    while CharInSet(PL^, [' ', #9]) do Inc(PL);
+    PS := PL;
+    while CharInSet(PL^, ['a'..'z','A'..'Z','0'..'9','_']) do Inc(PL);
+    Len := PL - PS;
+    if Len = 0 then Exit;
+    while CharInSet(PL^, [' ', #9]) do Inc(PL);
+    Result := PL^ <> '.';
+  end;
+
+var
+  Lines      : TArray<string>;
+  I, J       : Integer;
+  MethodStart: Integer;
+  MethodBegin: Integer;
+  type TNestedScope = record DeclLine, BeginLine, EndLine: Integer; end;
+  var Nested   : TArray<TNestedScope>;
+  var NS       : TNestedScope;
+  var CtxScopeStart, CtxScopeEnd: Integer;
+  var Tok, TokType: string;
+  var PL, PS, PT: PChar;
+  var BeginDepth: Integer;
+  var InVarSection: Boolean;
+  var CurLine: Integer;
+  var PTemp: PChar;
+  var P, PStart: PChar;
+  var Token, TypeStr: string;
+  var Dist, BestDist: Integer;
+  var InScope: Boolean;
+
+  procedure ReadTok(var Ptr: PChar; out T: string);
+  begin
+    while CharInSet(Ptr^, [' ', #9]) do Inc(Ptr);
+    if CharInSet(Ptr^, ['a'..'z','A'..'Z','_']) then
+    begin
+      PS := Ptr;
+      while CharInSet(Ptr^, ['a'..'z','A'..'Z','0'..'9','_']) do Inc(Ptr);
+      SetString(T, PS, Ptr - PS);
+    end
+    else
+    begin
+      T := '';
+      if Ptr^ <> #0 then Inc(Ptr);
+    end;
+  end;
+
+begin
+  Result := '';
+  if VarName = '' then Exit;
+
+  Lines := BufferText.Split([#10]);
+  for I := 0 to High(Lines) do
+    Lines[I] := Lines[I].TrimRight([#13]);
+
+  MethodStart := 0;
+  MethodBegin := 0;
+  var LimitI := ContextLine - 1;
+  if LimitI > High(Lines) then LimitI := High(Lines);
+  for I := 0 to LimitI do
+  begin
+    if IsLocalMethodDecl(Lines[I]) then
+      MethodStart := I + 1;
+  end;
+
+  SetLength(Nested, 0);
+  BeginDepth    := 0;
+  InVarSection  := False;
+  MethodBegin   := 0;
+
+  var LimitI2 := ContextLine;
+  if LimitI2 - 1 > High(Lines) then LimitI2 := High(Lines) + 1;
+  for I := MethodStart to LimitI2 do
+  begin
+    if I - 1 > High(Lines) then Break;
+    PL := PChar(Lines[I - 1]);
+    while CharInSet(PL^, [' ', #9]) do Inc(PL);
+    if (PL^ = '/') and ((PL+1)^ = '/') then Continue;
+
+    ReadTok(PL, Tok);
+    if Tok = '' then Continue;
+
+    if IsMethodKeyword(Tok) and (I > MethodStart) then
+    begin
+      NS.DeclLine := I;
+      NS.BeginLine := 0;
+      NS.EndLine   := 0;
+      SetLength(Nested, Length(Nested) + 1);
+      Nested[High(Nested)] := NS;
+    end
+    else if SameText(Tok, 'begin') then
+    begin
+      if BeginDepth = 0 then
+      begin
+        if MethodBegin = 0 then
+          MethodBegin := I
+        else
+        begin
+          for J := High(Nested) downto 0 do
+            if Nested[J].BeginLine = 0 then
+            begin
+              Nested[J].BeginLine := I;
+              Break;
+            end;
+        end;
+        Inc(BeginDepth);
+      end
+      else
+      begin
+        Inc(BeginDepth);
+      end;
+    end
+    else if SameText(Tok, 'end') then
+    begin
+      if BeginDepth > 0 then
+      begin
+        Dec(BeginDepth);
+        if BeginDepth = 0 then
+        begin
+        end
+        else
+        begin
+          for J := High(Nested) downto 0 do
+            if (Nested[J].BeginLine > 0) and (Nested[J].EndLine = 0) then
+            begin
+              Nested[J].EndLine := I;
+              Break;
+            end;
+        end;
+      end;
+    end;
+  end;
+
+  CtxScopeStart := MethodStart;
+  CtxScopeEnd   := MaxInt;
+  for I := 0 to High(Nested) do
+  begin
+    if (Nested[I].BeginLine > 0) and
+       (ContextLine >= Nested[I].DeclLine) and
+       (ContextLine <= Nested[I].BeginLine) then
+    begin
+      CtxScopeStart := Nested[I].DeclLine;
+      CtxScopeEnd   := Nested[I].BeginLine;
+      Break;
+    end;
+    if (Nested[I].BeginLine > 0) and (Nested[I].EndLine > 0) and
+       (ContextLine > Nested[I].BeginLine) and
+       (ContextLine < Nested[I].EndLine) then
+    begin
+      CtxScopeStart := Nested[I].DeclLine;
+      CtxScopeEnd   := Nested[I].EndLine;
+      Break;
+    end;
+  end;
+
+  BestDist := MaxInt;
+  CurLine  := 1;
+  P        := PChar(BufferText);
+
+  while P^ <> #0 do
+  begin
+    if P^ = #10 then begin Inc(CurLine); Inc(P); Continue; end;
+    if (P^ = '/') and ((P+1)^ = '/') then
+    begin
+      while (P^ <> #0) and (P^ <> #10) do Inc(P);
+      Continue;
+    end;
+
+    if CharInSet(P^, ['a'..'z','A'..'Z','_']) then
+    begin
+      PStart := P;
+      while CharInSet(P^, ['a'..'z','A'..'Z','0'..'9','_']) do Inc(P);
+      SetString(Token, PStart, P - PStart);
+
+      if SameText(Token, VarName) then
+      begin
+        InScope := (CurLine >= CtxScopeStart) and (CurLine <= CtxScopeEnd);
+        if not InScope then
+          InScope := (CurLine < MethodStart) or (MethodStart = 0);
+
+        if InScope then
+        begin
+          PTemp := P;
+          while CharInSet(PTemp^, [' ', #9]) do Inc(PTemp);
+          while PTemp^ = ',' do
+          begin
+            Inc(PTemp);
+            while CharInSet(PTemp^, [' ', #9]) do Inc(PTemp);
+            while CharInSet(PTemp^, ['a'..'z','A'..'Z','0'..'9','_']) do Inc(PTemp);
+            while CharInSet(PTemp^, [' ', #9]) do Inc(PTemp);
+          end;
+
+          if PTemp^ = ':' then
+          begin
+            Inc(PTemp);
+            if PTemp^ <> '=' then
+            begin
+              while CharInSet(PTemp^, [' ', #9]) do Inc(PTemp);
+              PStart := PTemp;
+
+              var GenDepth := 0;
+              var BracketDepth := 0;
+
+              while PTemp^ <> #0 do
+              begin
+                if PTemp^ = '<' then Inc(GenDepth)
+                else if PTemp^ = '>' then Dec(GenDepth)
+                else if PTemp^ = '[' then Inc(BracketDepth)
+                else if PTemp^ = ']' then Dec(BracketDepth);
+
+                if (GenDepth = 0) and (BracketDepth = 0) then
+                begin
+                  if CharInSet(PTemp^, [';', '=', #10, #13]) then Break;
+                end;
+                Inc(PTemp);
+              end;
+
+              SetString(TypeStr, PStart, PTemp - PStart);
+              TypeStr := Trim(TypeStr);
+              if TypeStr <> '' then
+              begin
+                Dist := Abs(CurLine - ContextLine);
+                if Dist < BestDist then
+                begin
+                  BestDist := Dist;
+                  Result   := TypeStr;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+      Continue;
+    end;
+    Inc(P);
+  end;
+end;
+
+
+function ResolveExpressionType(const Expr, Caminho, BufferText: string; LineNum: Integer): string;
+var
+  Parts: TArray<string>;
+  CurrentType, CleanPart: string;
+  I, BracketPos, ParenPos, FirstSymbolPos: Integer;
+  MemberSyms: TArray<TSymbolInfo>;
+  Found, IsArr: Boolean;
+begin
+  Parts := SplitExpression(Expr);
+  if Length(Parts) = 0 then Exit('');
+
+  CleanPart := Parts[0];
+  IsArr := False;
+
+  BracketPos := Pos('[', CleanPart);
+  ParenPos := Pos('(', CleanPart);
+
+  FirstSymbolPos := MaxInt;
+  if BracketPos > 0 then FirstSymbolPos := BracketPos;
+  if (ParenPos > 0) and (ParenPos < FirstSymbolPos) then FirstSymbolPos := ParenPos;
+
+  if FirstSymbolPos < MaxInt then
+  begin
+    if Pos('[', Parts[0]) > 0 then IsArr := True;
+    CleanPart := Copy(CleanPart, 1, FirstSymbolPos - 1);
+  end;
+
+  CurrentType := QuickLookupInBuffer(BufferText, CleanPart, LineNum);
+  if CurrentType = '' then CurrentType := GSymbolIndex.LookupType(CleanPart, Caminho, LineNum, BufferText);
+  if CurrentType = '' then CurrentType := CleanPart;
+
+  if IsArr then CurrentType := ExtractBaseType(CurrentType);
+
+  for I := 1 to High(Parts) do
+  begin
+    CleanPart := Parts[I];
+    if CleanPart = '' then Continue;
+
+    IsArr := False;
+    BracketPos := Pos('[', CleanPart);
+    ParenPos := Pos('(', CleanPart);
+
+    FirstSymbolPos := MaxInt;
+    if BracketPos > 0 then FirstSymbolPos := BracketPos;
+    if (ParenPos > 0) and (ParenPos < FirstSymbolPos) then FirstSymbolPos := ParenPos;
+
+    if FirstSymbolPos < MaxInt then
+    begin
+      if Pos('[', Parts[I]) > 0 then IsArr := True;
+      CleanPart := Copy(CleanPart, 1, FirstSymbolPos - 1);
+    end;
+
+    MemberSyms := GSymbolIndex.GetMethodsOfType(CurrentType, Caminho);
+
+    Found := False;
+    for var Sym in MemberSyms do
+    begin
+      if SameText(Sym.Name, CleanPart) then
+      begin
+        CurrentType := Sym.DataType;
+        Found := True;
+        Break;
+      end;
+    end;
+
+    if not Found then Exit('');
+
+    if IsArr then CurrentType := ExtractBaseType(CurrentType);
+  end;
+
+  Result := CurrentType;
+end;
+
+procedure ExecutarShowHintAtCursor;
+var
+  ModSvc: IOTAModuleServices;
+  EditSvc: IOTAEditorServices;
+  EditView: IOTAEditView;
+  Content: string;
+  CaretLinear, I, Depth, OpenParenPos: Integer;
+  Expr: string;
+  IsArray: Boolean;
+  TypeName, MethodName, Caminho, LowerType: string;
+  Parts: TArray<string>;
+  Methods: TArray<TSymbolInfo>;
+  Sig: string;
+  CaretPt: TPoint;
+  EdHandle: HWND;
+begin
+  if BorlandIDEServices.QueryInterface(IOTAEditorServices, EditSvc) <> S_OK then Exit;
+  EditView := EditSvc.TopView;
+  if not Assigned(EditView) then Exit;
+
+  if BorlandIDEServices.QueryInterface(IOTAModuleServices, ModSvc) <> S_OK then Exit;
+  if not Assigned(ModSvc.CurrentModule) then Exit;
+  Caminho := ModSvc.CurrentModule.FileName;
+
+  Content := LerBufferEditor(EditView.Buffer);
+  CaretLinear := RowColToLinearPos(Content, EditView.CursorPos.Line, EditView.CursorPos.Col);
+
+  if CaretLinear <= 1 then Exit;
+
+  OpenParenPos := 0;
+  Depth := 0;
+  for I := CaretLinear - 1 downto 1 do
+  begin
+    if Content[I] = ')' then Inc(Depth)
+    else if Content[I] = '(' then
+    begin
+      if Depth = 0 then
+      begin
+        OpenParenPos := I;
+        Break;
+      end
+      else Dec(Depth);
+    end
+    else if (Content[I] = ';') and (Depth = 0) then
+      Break;
+  end;
+
+  if OpenParenPos = 0 then Exit;
+
+  Expr := ExtractExpressionEx(AnsiString(Content), OpenParenPos - 1, IsArray);
+  if Expr = '' then Exit;
+
+  Parts := SplitExpression(Expr);
+  if Length(Parts) = 0 then Exit;
+
+  Sig := '';
+  if Length(Parts) = 1 then
+  begin
+    MethodName := Parts[0];
+    TypeName := FindCurrentClassContext(Content, EditView.CursorPos.Line);
+    if TypeName <> '' then
+      Methods := GSymbolIndex.GetMethodsOfType(TypeName, Caminho, True)
+    else
+      SetLength(Methods, 0);
+
+    for I := 0 to High(Methods) do
+    begin
+      if SameText(Methods[I].Name, MethodName) and (Methods[I].Kind in [skMethod]) then
+      begin
+        Sig := ExtractParamString(Methods[I].Signature);
+        if Sig <> '' then Break;
+      end;
+    end;
+
+    if Sig = '' then
+    begin
+      if Assigned(GLocalDB) and GLocalDB.IsConnected then
+      begin
+        Methods := GLocalDB.QuerySymbolByName(MethodName);
+        for I := 0 to High(Methods) do
+        begin
+          if Methods[I].Kind = skMethod then
+          begin
+            Sig := ExtractParamString(Methods[I].Signature);
+            if Sig <> '' then Break;
+          end;
+        end;
+      end;
+    end;
+
+    if Sig = '' then
+    begin
+      if Assigned(GPublicDB) and GPublicDB.IsConnected then
+      begin
+        Methods := GPublicDB.QuerySymbolByName(MethodName);
+        for I := 0 to High(Methods) do
+        begin
+          if Methods[I].Kind = skMethod then
+          begin
+            Sig := ExtractParamString(Methods[I].Signature);
+            if Sig <> '' then Break;
+          end;
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    MethodName := Parts[High(Parts)];
+    var PrefixExpr := Copy(Expr, 1, Length(Expr) - Length(MethodName) - 1);
+    TypeName := ResolveExpressionType(PrefixExpr, Caminho, Content, EditView.CursorPos.Line);
+
+    if TypeName <> '' then
+    begin
+      if IsArray then TypeName := ExtractBaseType(TypeName);
+      LowerType := LowerCase(TypeName);
+      if (Pos('tarray<', LowerType) > 0) or (Pos('array of ', LowerType) > 0) or (Pos('array[', LowerType) > 0) then
+        TypeName := '__tarray__';
+
+      Methods := GSymbolIndex.GetMethodsOfType(TypeName, Caminho, False);
+      for I := 0 to High(Methods) do
+      begin
+        if SameText(Methods[I].Name, MethodName) and (Methods[I].Kind in [skMethod]) then
+        begin
+          Sig := ExtractParamString(Methods[I].Signature);
+          if Sig <> '' then Break;
+        end;
+      end;
+    end;
+  end;
+
+  if Sig = '' then Exit;
+
+  EdHandle := GetFocus;
+  if EdHandle = 0 then
+    if Assigned(EditorPopupInstance) then
+      EdHandle := EditorPopupInstance.FEditorHandle;
+
+  if (EdHandle <> 0) and Winapi.Windows.GetCaretPos(CaretPt) then
+  begin
+    Winapi.Windows.ClientToScreen(EdHandle, CaretPt);
+    GParamHintForm.ShowHint(CaretPt.X, CaretPt.Y, Sig);
+
+    GHintActive := True;
+    GHintLinearStart := OpenParenPos;
+    GHintEditView := EditView;
+    GHintTimer.Enabled := False;
+    GHintTimer.Enabled := True;
+    if Assigned(EditorPopupInstance) then
+      EditorPopupInstance.OnHintTimerFire(nil);
+  end;
+end;
+
+procedure TEditorPopup.OnAutoHintTimerFire(Sender: TObject);
+begin
+  GAutoHintTimer.Enabled := False;
+  ExecutarShowHintAtCursor;
+end;
+
+procedure TEditorPopup.OnFilterTimerFire(Sender: TObject);
+var
+  EditSvc: IOTAEditorServices;
+  EditView: IOTAEditView;
+  CaretLine, CaretCol: Integer;
+  BufferText, LineText, TypedText: string;
+begin
+  if not Visible then
+  begin
+    FFilterTimer.Enabled := False;
+    Exit;
+  end;
+
+  if BorlandIDEServices.QueryInterface(IOTAEditorServices, EditSvc) <> S_OK then Exit;
+  EditView := EditSvc.TopView;
+  if not Assigned(EditView) then Exit;
+
+  CaretLine := EditView.CursorPos.Line;
+  CaretCol := EditView.CursorPos.Col;
+
+  if (CaretLine <> FTypedStartLine) or (CaretCol < FTypedStartCol) then
+  begin
+    Hide;
+    Exit;
+  end;
+
+  BufferText := LerBufferEditor(EditView.Buffer);
+  LineText := GetLineText(BufferText, CaretLine);
+
+  if CaretCol > Length(LineText) + 1 then CaretCol := Length(LineText) + 1;
+
+  TypedText := Copy(LineText, FTypedStartCol, CaretCol - FTypedStartCol);
+
+  if TypedText <> FLastTypedText then
+  begin
+    FLastTypedText := TypedText;
+    ApplyFilter(TypedText);
+  end;
+end;
+
+procedure TEditorPopup.OnHintTimerFire(Sender: TObject);
+var
+  Content: string;
+  CaretLinear: Integer;
+  I, Depth, CommaCount: Integer;
+  Valid, InStr: Boolean;
+begin
+  if not GHintActive or not Assigned(GHintEditView) then
+  begin
+    GHintTimer.Enabled := False;
+    if Assigned(GParamHintForm) then GParamHintForm.Hide;
+    Exit;
+  end;
+
+  Content := LerBufferEditor(GHintEditView.Buffer);
+  CaretLinear := RowColToLinearPos(Content, GHintEditView.CursorPos.Line, GHintEditView.CursorPos.Col);
+
+  if (GHintLinearStart <= 0) or (GHintLinearStart > Length(Content)) or (Content[GHintLinearStart] <> '(') then
+  begin
+    GHintActive := False;
+    GHintTimer.Enabled := False;
+    if Assigned(GParamHintForm) then GParamHintForm.Hide;
+    Exit;
+  end;
+
+  if CaretLinear <= GHintLinearStart then
+  begin
+    GHintActive := False;
+    GHintTimer.Enabled := False;
+    if Assigned(GParamHintForm) then GParamHintForm.Hide;
+    Exit;
+  end;
+
+  Depth := 0;
+  CommaCount := 0;
+  Valid := True;
+  InStr := False;
+
+  for I := GHintLinearStart + 1 to CaretLinear - 1 do
+  begin
+    if Content[I] = '''' then
+    begin
+      InStr := not InStr;
+      Continue;
+    end;
+
+    if InStr then Continue;
+
+    if Content[I] = '(' then Inc(Depth)
+    else if Content[I] = ')' then
+    begin
+      if Depth = 0 then
+      begin
+        Valid := False;
+        Break;
+      end
+      else Dec(Depth);
+    end
+    else if (Content[I] = ';') and (Depth = 0) then
+    begin
+      Valid := False;
+      Break;
+    end
+    else if (Content[I] = ',') and (Depth = 0) then
+    begin
+      Inc(CommaCount);
+    end;
+  end;
+
+  if not Valid then
+  begin
+    GHintActive := False;
+    GHintTimer.Enabled := False;
+    if Assigned(GParamHintForm) then GParamHintForm.Hide;
+    Exit;
+  end;
+
+  if Assigned(GParamHintForm) then
+    GParamHintForm.UpdateActiveParam(CommaCount);
+end;
+
+function GetBDSPath: string;
+var
+  Reg: TRegistry;
+  I: Integer;
+  Versions: array[0..5] of string;
+begin
+  Result := '';
+  Versions[0] := '23.0'; Versions[1] := '22.0'; Versions[2] := '21.0';
+  Versions[3] := '20.0'; Versions[4] := '19.0'; Versions[5] := '18.0';
+  Reg := TRegistry.Create(KEY_READ);
+  try
+    Reg.RootKey := HKEY_CURRENT_USER;
+    for I := 0 to High(Versions) do
+    begin
+      if Reg.OpenKeyReadOnly('Software\Embarcadero\BDS\' + Versions[I]) then
+      begin
+        if Reg.ValueExists('RootDir') then
+          Result := Reg.ReadString('RootDir');
+        Reg.CloseKey;
+        if Result <> '' then Exit;
+      end;
+    end;
+  finally
+    Reg.Free;
+  end;
+end;
+
+function GetDelphiSourceDirs: TArray<string>;
+var
+  BDS: string;
+  Dirs: TStringList;
+  Full: string;
+  SubDir: string;
+begin
+  SetLength(Result, 0);
+  BDS := GetBDSPath;
+  if BDS = '' then Exit;
+  Dirs := TStringList.Create;
+  try
+    for SubDir in TArray<string>.Create(
+      'source\rtl\common',
+      'source\rtl\win',
+      'source\rtl\sys',
+      'source\vcl',
+      'source\fmx',
+      'source\data',
+      'source\ToolsAPI') do
+    begin
+      Full := TPath.Combine(BDS, SubDir);
+      if DirectoryExists(Full) then Dirs.Add(Full);
+    end;
+    SetLength(Result, Dirs.Count);
+    for var I := 0 to Dirs.Count - 1 do Result[I] := Dirs[I];
+  finally
+    Dirs.Free;
+  end;
+end;
+
+procedure IndexUsedUnits(const CaminhoUnit: string);
+var
+  Conteudo, Token, UnitFile, Dir: string;
+  P, PStart: PChar;
+  InUses: Boolean;
+  Sub, C: string;
+begin
+  if not Assigned(GSymbolIndex) then Exit;
+  try
+    Conteudo := TFile.ReadAllText(CaminhoUnit);
+  except
+    Exit;
+  end;
+  Dir    := ExtractFilePath(CaminhoUnit);
+  InUses := False;
+  P      := PChar(Conteudo);
+  while P^ <> #0 do
+  begin
+    while CharInSet(P^, [' ', #9, #13, #10]) do Inc(P);
+    if (P^ = '/') and ((P+1)^ = '/') then
+    begin
+      while (P^ <> #0) and (P^ <> #10) do Inc(P);
+      Continue;
+    end;
+    if CharInSet(P^, ['a'..'z', 'A'..'Z', '_']) then
+    begin
+      PStart := P;
+      while CharInSet(P^, ['a'..'z','A'..'Z','0'..'9','_','.']) do Inc(P);
+      SetString(Token, PStart, P - PStart);
+      if SameText(Token, 'uses') then
+        InUses := True
+      else if SameText(Token, 'implementation') or SameText(Token, 'begin') or
+              SameText(Token, 'type') or SameText(Token, 'var') or
+              SameText(Token, 'const') then
+        InUses := False
+      else if InUses then
+      begin
+        UnitFile := TPath.Combine(Dir, Token + '.pas');
+        if not FileExists(UnitFile) then
+        begin
+          for Sub in GGlobalSearchPaths do
+          begin
+            C := TPath.Combine(Sub, Token + '.pas');
+            if FileExists(C) then
+            begin
+              UnitFile := C;
+              Break;
+            end;
+          end;
+        end;
+        if FileExists(UnitFile) then
+          GSymbolIndex.IndexFile(UnitFile, True);
+      end;
+      Continue;
+    end;
+    if (P^ = ';') and InUses then InUses := False;
+    Inc(P);
+  end;
+end;
+
+procedure ShowPopupAtTextCursor;
+var
+  ModSvc    : IOTAModuleServices;
+  Module    : IOTAModule;
+  EditSvc   : IOTAEditorServices;
+  EditView  : IOTAEditView;
+  OTAPos    : TOTAEditPos;
+  EdHandle  : HWND;
+  P         : TPoint;
+  Caminho, BufferText, LineText, VarName, TypeName, LowerType: string;
+  Col, OrigCol, LineNum, Idx, Idx2: Integer;
+  Monitor   : TMonitor;
+  WorkArea  : TRect;
+  TargetX, TargetY: Integer;
+  Methods   : TArray<TSymbolInfo>;
+  IsArray   : Boolean;
+begin
+  if not Assigned(EditorPopupInstance) then Exit;
+  if BorlandIDEServices.QueryInterface(IOTAModuleServices, ModSvc) <> S_OK then Exit;
+  Module := ModSvc.CurrentModule;
+  if not Assigned(Module) then Exit;
+  Caminho := Module.FileName;
+  if (Caminho = '') or (ExtractFileExt(Caminho) <> '.pas') then Exit;
+  if BorlandIDEServices.QueryInterface(IOTAEditorServices, EditSvc) <> S_OK then Exit;
+  EditView := EditSvc.TopView;
+  if not Assigned(EditView) then Exit;
+
+  OTAPos  := EditView.CursorPos;
+  LineNum := OTAPos.Line;
+  Col     := OTAPos.Col;
+
+  EdHandle := GetFocus;
+  P := Point(0, 0);
+  if EdHandle <> 0 then
+  begin
+    Winapi.Windows.GetCaretPos(P);
+    Winapi.Windows.ClientToScreen(EdHandle, P);
+  end;
+
+  EditorPopupInstance.FEditorHandle := EdHandle;
+
+  BufferText := LerBufferEditor(EditView.Buffer);
+  LineText   := GetLineText(BufferText, LineNum);
+
+  if Assigned(GSymbolIndex) then GSymbolIndex.IndexFile(Caminho);
+
+  VarName  := '';
+  TypeName := '';
+  SetLength(Methods, 0);
+
+  OrigCol := Col;
+  Dec(Col);
+
+  while (Col > 0) and (Col <= Length(LineText)) and CharInSet(LineText[Col], ['a'..'z', 'A'..'Z', '0'..'9', '_']) do
+    Dec(Col);
+
+  EditorPopupInstance.FTypedStartLine := LineNum;
+  EditorPopupInstance.FTypedStartCol := Col + 1;
+
+  if (Col > 0) and (LineText[Col] = '.') then
+  begin
+    VarName := ExtractExpressionEx(AnsiString(LineText), Col - 1, IsArray);
+
+    var IsSelfAccess := SameText(VarName, 'Self');
+
+    if IsSelfAccess then
+    begin
+      TypeName := FindCurrentClassContext(BufferText, LineNum);
+    end
+    else
+    begin
+      if Assigned(GSymbolIndex) and (VarName <> '') then
+      begin
+        TypeName := ResolveExpressionType(VarName, Caminho, BufferText, LineNum);
+        if IsArray then
+          TypeName := ExtractBaseType(TypeName)
+        else
+        begin
+          LowerType := LowerCase(TypeName);
+          if (Pos('tarray<', LowerType) > 0) or (Pos('array of ', LowerType) > 0) or (Pos('array[', LowerType) > 0) then
+            TypeName := '__tarray__';
+        end;
+      end;
+    end;
+
+    if Assigned(GSymbolIndex) and (TypeName <> '') then
+      Methods := GSymbolIndex.GetMethodsOfType(TypeName, Caminho, IsSelfAccess);
+
+    EditorPopupInstance.ObservedType := TypeName;
+    EditorPopupInstance.CarregarItensLista(Methods);
+  end
+  else
+  begin
+    EditorPopupInstance.FTypedStartLine := LineNum;
+    EditorPopupInstance.FTypedStartCol := Col + 1;
+
+    EditorPopupInstance.ObservedType := ExtractFileName(Caminho);
+    EditorPopupInstance.CarregarItensGrid(Caminho);
+  end;
+
+  if OrigCol > EditorPopupInstance.FTypedStartCol then
+    EditorPopupInstance.FLastTypedText := Copy(LineText, EditorPopupInstance.FTypedStartCol, OrigCol - EditorPopupInstance.FTypedStartCol)
+  else
+    EditorPopupInstance.FLastTypedText := '';
+
+  EditorPopupInstance.FFilterMode := 0;
+  EditorPopupInstance.UpdateRegion;
+  EditorPopupInstance.ApplyFilter(EditorPopupInstance.FLastTypedText);
+  EditorPopupInstance.FFilterTimer.Enabled := False;
+  EditorPopupInstance.FFilterTimer.Enabled := True;
+
+  Monitor := Screen.MonitorFromPoint(P);
+  if Assigned(Monitor) then WorkArea := Monitor.WorkareaRect else WorkArea := Screen.DesktopRect;
+  TargetX := P.X;
+  TargetY := P.Y - EditorPopupInstance.Height;
+  if TargetY < WorkArea.Top then TargetY := P.Y + 24;
+  if TargetX + EditorPopupInstance.Width > WorkArea.Right then TargetX := WorkArea.Right - EditorPopupInstance.Width;
+  if TargetX < WorkArea.Left then TargetX := WorkArea.Left;
+  EditorPopupInstance.ShowAtPos(TargetX, TargetY);
+end;
+
+procedure TEditorPopup.OnPointTimerFire(Sender: TObject);
+begin
+  GPointTimer.Enabled := False;
+  ShowPopupAtTextCursor;
+end;
+
+function TMyKeyboardBinding.GetBindingType: TBindingType;
+begin
+  Result := btPartial;
+end;
+
+function TMyKeyboardBinding.GetDisplayName: string;
+begin
+  Result := 'CS Code Insight';
+end;
+
+function TMyKeyboardBinding.GetName: string;
+begin
+  Result := 'CSCodeInsight.Binding';
+end;
+
+procedure TMyKeyboardBinding.KeyHandler(const Context: IOTAKeyContext; KeyCode: TShortCut; var BindingResult: TKeyBindingResult);
+var
+  VK   : Word;
+  Shift: TShiftState;
+begin
+  ShortCutToKey(KeyCode, VK, Shift);
+
+  if (VK = VK_SPACE) and (ssCtrl in Shift) and not (ssShift in Shift) then
+  begin
+    if GHintActive then
+    begin
+      BindingResult := krUnhandled;
+      Exit;
+    end;
+
+    if GTemplateActive then GTemplateActive := False;
+
+    ShowPopupAtTextCursor;
+    BindingResult := krHandled;
+    Exit;
+  end;
+
+  if (VK = VK_SPACE) and (ssCtrl in Shift) and (ssShift in Shift) then
+  begin
+    if GTemplateActive then GTemplateActive := False;
+    ExecutarShowHintAtCursor;
+    BindingResult := krHandled;
+    Exit;
+  end;
+
+  if (VK = VK_F1) and (ssAlt in Shift) and
+     not (ssCtrl in Shift) and
+     not (ssShift in Shift) then
+  begin
+    if Assigned(GoToManager) then
+      GoToManager.ExecutarGoToDefinition;
+
+    BindingResult := krHandled;
+    Exit;
+  end;
+
+  BindingResult := krUnhandled;
+end;
+
+procedure TMyKeyboardBinding.DotKeyHandler(const Context: IOTAKeyContext; KeyCode: TShortCut; var BindingResult: TKeyBindingResult);
+var
+  EditSvc: IOTAEditorServices;
+  EditView: IOTAEditView;
+  BufferText, LineText: string;
+  LineNum, Col: Integer;
+  CharBefore: Char;
+  ShouldInvoke: Boolean;
+
+  function IsInCommentOrString(const LineText: string; Col: Integer): Boolean;
+  var
+    I, Limit: Integer;
+    InString, InComment1, InComment2, InComment3: Boolean;
+  begin
+    InString := False;
+    InComment1 := False;
+    InComment2 := False;
+    InComment3 := False;
+
+    Limit := Col - 1;
+    if Limit > Length(LineText) then
+      Limit := Length(LineText);
+
+    for I := 1 to Limit do
+    begin
+      if InString then
+      begin
+        if LineText[I] = '''' then InString := False;
+        Continue;
+      end;
+
+      if InComment1 then Continue;
+
+      if InComment2 then
+      begin
+        if LineText[I] = '}' then InComment2 := False;
+        Continue;
+      end;
+
+      if InComment3 then
+      begin
+        if (LineText[I] = '*') and (I < Length(LineText)) and (LineText[I+1] = ')') then
+          InComment3 := False;
+        Continue;
+      end;
+
+      if LineText[I] = '''' then
+      begin
+        InString := True;
+        Continue;
+      end;
+
+      if (LineText[I] = '/') and (I < Length(LineText)) and (LineText[I+1] = '/') then
+      begin
+        InComment1 := True;
+        Continue;
+      end;
+
+      if LineText[I] = '{' then
+      begin
+        InComment2 := True;
+        Continue;
+      end;
+
+      if (LineText[I] = '(') and (I < Length(LineText)) and (LineText[I+1] = '*') then
+      begin
+        InComment3 := True;
+        Continue;
+      end;
+    end;
+
+    Result := InString or InComment1 or InComment2 or InComment3;
+  end;
+
+begin
+  BindingResult := krHandled;
+  if BorlandIDEServices.QueryInterface(IOTAEditorServices, EditSvc) = S_OK then
+  begin
+    EditView := EditSvc.TopView;
+    if Assigned(EditView) then
+    begin
+      ShouldInvoke := True;
+
+      try
+        LineNum := EditView.CursorPos.Line;
+        Col := EditView.CursorPos.Col;
+        BufferText := LerBufferEditor(EditView.Buffer);
+        LineText := GetLineText(BufferText, LineNum);
+
+        if (Col > 1) and (Col <= Length(LineText) + 1) then
+        begin
+          CharBefore := LineText[Col - 1];
+          if CharInSet(CharBefore, [' ', #9, '.', ',']) then
+            ShouldInvoke := False
+          else if IsInCommentOrString(LineText, Col) then
+            ShouldInvoke := False;
+        end
+        else if Col > Length(LineText) + 1 then
+          ShouldInvoke := False
+        else
+          ShouldInvoke := False;
+      except
+        ShouldInvoke := False;
+      end;
+
+      try
+        EditView.Position.InsertCharacter('.');
+        EditView.Paint;
+      except
+      end;
+
+      if ShouldInvoke and Assigned(GPointTimer) then
+      begin
+        GPointTimer.Enabled := False;
+        GPointTimer.Enabled := True;
+      end;
+    end;
+  end;
+end;
+
+procedure TMyKeyboardBinding.BindKeyboard(const BindingServices: IOTAKeyBindingServices);
+begin
+  BindingServices.AddKeyBinding([ShortCut(VK_SPACE, [ssCtrl])], KeyHandler, nil);
+  BindingServices.AddKeyBinding([ShortCut(VK_SPACE, [ssCtrl, ssShift])], KeyHandler, nil);
+  BindingServices.AddKeyBinding([ShortCut(VK_F1, [ssShift])], KeyHandler, nil);
+
+  BindingServices.AddKeyBinding([ShortCut(VK_OEM_PERIOD, [])], DotKeyHandler, nil);
+  BindingServices.AddKeyBinding([ShortCut(VK_DECIMAL, [])], DotKeyHandler, nil);
+end;
+
+function GetGlobalLibraryPaths: TArray<string>;
+var
+  Reg: TRegistry;
+  I: Integer;
+  Versions: array[0..5] of string;
+  PathsStr, PStr, BDS, FullPath: string;
+  Paths: TArray<string>;
+  List: TStringList;
+begin
+  SetLength(Result, 0);
+  Versions[0] := '23.0'; Versions[1] := '22.0'; Versions[2] := '21.0';
+  Versions[3] := '20.0'; Versions[4] := '19.0'; Versions[5] := '18.0';
+  Reg := TRegistry.Create(KEY_READ);
+  List := TStringList.Create;
+  try
+    Reg.RootKey := HKEY_CURRENT_USER;
+    for I := 0 to High(Versions) do
+    begin
+      if Reg.OpenKeyReadOnly('Software\Embarcadero\BDS\' + Versions[I] + '\Library\Win32') then
+      begin
+        if Reg.ValueExists('Search Path') then
+        begin
+          PathsStr := Reg.ReadString('Search Path');
+          BDS := GetBDSPath;
+          Paths := PathsStr.Split([';']);
+          for PStr in Paths do
+          begin
+            if Trim(PStr) = '' then Continue;
+            FullPath := ReplaceText(PStr, '$(BDS)', BDS);
+            try
+              if DirectoryExists(FullPath) then
+                List.Add(FullPath);
+            except
+            end;
+          end;
+        end;
+        Reg.CloseKey;
+        Break;
+      end;
+    end;
+    SetLength(Result, List.Count);
+    for I := 0 to List.Count - 1 do
+      Result[I] := List[I];
+  finally
+    List.Free;
+    Reg.Free;
+  end;
+end;
+
+procedure Register;
+var
+  DelphiDirs: TArray<string>;
+  LibPaths: TArray<string>;
+  AppData: string;
+  PublicDBPath: string;
+  I: Integer;
+begin
+  EditorPopupInstance := TEditorPopup.Create(nil);
+  GParamHintForm := TParamHintForm.Create(nil);
+
+  GHintTimer := TTimer.Create(nil);
+  GHintTimer.Interval := 150;
+  GHintTimer.Enabled := False;
+  GHintTimer.OnTimer := EditorPopupInstance.OnHintTimerFire;
+
+  GAutoHintTimer := TTimer.Create(nil);
+  GAutoHintTimer.Interval := 50;
+  GAutoHintTimer.Enabled := False;
+  GAutoHintTimer.OnTimer := EditorPopupInstance.OnAutoHintTimerFire;
+
+  GPointTimer := TTimer.Create(nil);
+  GPointTimer.Interval := 150;
+  GPointTimer.Enabled := False;
+  GPointTimer.OnTimer := EditorPopupInstance.OnPointTimerFire;
+
+  GKeyboardBindingIndex := (BorlandIDEServices as IOTAKeyboardServices).AddKeyboardBinding(TMyKeyboardBinding.Create);
+  GIDENotifierIndex := (BorlandIDEServices as IOTAServices).AddNotifier(TMyIDENotifier.Create);
+
+  RegisterGlobalFileWatchers;
+
+  AppData := TPath.Combine(TPath.GetHomePath, 'CodeInsight');
+  ForceDirectories(AppData);
+  PublicDBPath := TPath.Combine(AppData, 'publico.db');
+
+  GPublicDir := LoadPublicDir;
+
+  GPublicDB.Connect(PublicDBPath);
+
+  LibPaths := GetGlobalLibraryPaths;
+  DelphiDirs := GetDelphiSourceDirs;
+
+  SetLength(GGlobalSearchPaths, Length(LibPaths) + Length(DelphiDirs));
+  SetLength(GDelphiLibDirs, Length(LibPaths) + Length(DelphiDirs));
+
+  for I := 0 to High(LibPaths) do
+  begin
+    GGlobalSearchPaths[I] := LibPaths[I];
+    GDelphiLibDirs[I] := LibPaths[I];
+  end;
+
+  for I := 0 to High(DelphiDirs) do
+  begin
+    GGlobalSearchPaths[Length(LibPaths) + I] := DelphiDirs[I];
+    GDelphiLibDirs[Length(LibPaths) + I] := DelphiDirs[I];
+  end;
+
+  if Assigned(GSymbolIndex) then
+  begin
+    GSymbolIndex.SetSearchPaths(GGlobalSearchPaths);
+    GSymbolIndex.BuildRTLIndex(DelphiDirs);
+  end;
+
+  TriggerProjectIndexing;
+end;
+
+initialization
+
+finalization
+  if GKeyboardBindingIndex >= 0 then
+  begin
+    (BorlandIDEServices as IOTAKeyboardServices).RemoveKeyboardBinding(GKeyboardBindingIndex);
+    GKeyboardBindingIndex := -1;
+  end;
+
+  if GIDENotifierIndex >= 0 then
+  begin
+    (BorlandIDEServices as IOTAServices).RemoveNotifier(GIDENotifierIndex);
+    GIDENotifierIndex := -1;
+  end;
+
+  UnregisterGlobalFileWatchers;
+
+  FreeAndNil(GPointTimer);
+  FreeAndNil(GAutoHintTimer);
+  FreeAndNil(GHintTimer);
+  FreeAndNil(GParamHintForm);
+  FreeAndNil(EditorPopupInstance);
+
+end.

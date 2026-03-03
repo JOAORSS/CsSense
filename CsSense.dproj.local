@@ -1,0 +1,37 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BorlandProject>
+	<Transactions>
+    <Transaction>2026/02/20 14:11:52.000.646,=rtl.dcp</Transaction>
+    <Transaction>2026/02/20 14:12:17.000.711,=rtl.dcp</Transaction>
+    <Transaction>2026/03/02 13:39:21.000.624,=rtl.dcp</Transaction>
+    <Transaction>2026/03/02 13:39:52.000.003,C:\Users\JoaoRaenke\Documents\Embarcadero\Studio\Projects\Package1.dproj=C:\Users\JoaoRaenke\Documents\Embarcadero\Studio\Projects\CsSense.dproj</Transaction>
+    <Transaction>2026/03/02 13:40:53.000.323,=C:\Projetos\CsCodeInsigth\ConfigManager.pas</Transaction>
+    <Transaction>2026/03/02 13:40:53.000.291,=C:\Projetos\CsCodeInsigth\BackgroundIndexer.pas</Transaction>
+    <Transaction>2026/03/02 13:41:03.000.529,=C:\Projetos\CsCodeInsigth\FileWatcherNotifier.pas</Transaction>
+    <Transaction>2026/03/02 13:41:03.000.513,=C:\Projetos\CsCodeInsigth\ExtratorUnit.pas</Transaction>
+    <Transaction>2026/03/02 13:41:03.000.619,=C:\Projetos\CsCodeInsigth\SymbolIndex.pas</Transaction>
+    <Transaction>2026/03/02 13:41:03.000.495,=C:\Projetos\CsCodeInsigth\EditorPopupForm.pas</Transaction>
+    <Transaction>2026/03/02 13:41:03.000.581,=C:\Projetos\CsCodeInsigth\GoToDefinition.pas</Transaction>
+    <Transaction>2026/03/02 13:41:03.000.600,=C:\Projetos\CsCodeInsigth\SQLiteEngine.pas</Transaction>
+    <Transaction>2026/03/02 13:41:03.000.660,=C:\Projetos\CsCodeInsigth\SymbolTypes.pas</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.552,C:\Projetos\CsCodeInsigth\SQLiteEngine.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.406,C:\Projetos\CsCodeInsigth\ConfigManager.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.488,C:\Projetos\CsCodeInsigth\ExtratorUnit.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.529,C:\Projetos\CsCodeInsigth\GoToDefinition.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.590,C:\Projetos\CsCodeInsigth\SymbolTypes.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.323,C:\Projetos\CsCodeInsigth\BackgroundIndexer.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.571,C:\Projetos\CsCodeInsigth\SymbolIndex.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.510,C:\Projetos\CsCodeInsigth\FileWatcherNotifier.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:27.000.457,C:\Projetos\CsCodeInsigth\EditorPopupForm.pas=</Transaction>
+    <Transaction>2026/03/02 13:41:58.000.647,C:\Users\JoaoRaenke\Documents\Embarcadero\Studio\Projects\CsSense.dproj=C:\Projetos\CsSense\CsSense.dproj</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.381,=C:\Projetos\CsSense\BackgroundIndexer.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.399,=C:\Projetos\CsSense\ConfigManager.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.615,=C:\Projetos\CsSense\SymbolTypes.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.475,=C:\Projetos\CsSense\ExtratorUnit.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.570,=C:\Projetos\CsSense\SymbolIndex.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.458,=C:\Projetos\CsSense\EditorPopupForm.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.537,=C:\Projetos\CsSense\GoToDefinition.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.553,=C:\Projetos\CsSense\SQLiteEngine.pas</Transaction>
+    <Transaction>2026/03/02 13:42:45.000.489,=C:\Projetos\CsSense\FileWatcherNotifier.pas</Transaction>
+  </Transactions>
+</BorlandProject>
