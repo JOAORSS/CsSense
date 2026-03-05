@@ -130,6 +130,24 @@ type
 var
   GParamHintForm: TParamHintForm;
 
+function IsCodeEditorFocused: Boolean;
+var
+  FocusedWnd: HWND;
+  ClassNameBuf: array[0..127] of Char;
+  FocusedClass: string;
+begin
+  Result := False;
+  FocusedWnd := GetFocus;
+  if FocusedWnd = 0 then Exit;
+
+  if GetClassName(FocusedWnd, ClassNameBuf, Length(ClassNameBuf)) = 0 then Exit;
+  FocusedClass := string(ClassNameBuf);
+
+  Result :=
+    ContainsText(FocusedClass, 'EditControl') or
+    ContainsText(FocusedClass, 'SynEdit');
+end;
+
 function GetSafeFileName(const Path: string): string;
 var
   I: Integer;
@@ -855,6 +873,8 @@ var
 begin
   if Msg.message = WM_CHAR then
   begin
+    if not IsCodeEditorFocused then Exit;
+
     if (Chr(Msg.wParam) = '(') or ((Chr(Msg.wParam) = ',') and not GHintActive) then
     begin
       if Assigned(GAutoHintTimer) then
@@ -2929,6 +2949,8 @@ end;
 
 procedure TMyKeyboardBinding.DotKeyHandler(const Context: IOTAKeyContext; KeyCode: TShortCut; var BindingResult: TKeyBindingResult);
 var
+  ModSvc: IOTAModuleServices;
+  Module: IOTAModule;
   EditSvc: IOTAEditorServices;
   EditView: IOTAEditView;
   BufferText, LineText: string;
@@ -3002,12 +3024,20 @@ var
   end;
 
 begin
-  BindingResult := krHandled;
+  BindingResult := krUnhandled;
+  if not IsCodeEditorFocused then Exit;
+
+  if BorlandIDEServices.QueryInterface(IOTAModuleServices, ModSvc) <> S_OK then Exit;
+  Module := ModSvc.CurrentModule;
+  if not Assigned(Module) then Exit;
+  if not SameText(ExtractFileExt(Module.FileName), '.pas') then Exit;
+
   if BorlandIDEServices.QueryInterface(IOTAEditorServices, EditSvc) = S_OK then
   begin
     EditView := EditSvc.TopView;
     if Assigned(EditView) then
     begin
+      BindingResult := krHandled;
       ShouldInvoke := True;
 
       try
