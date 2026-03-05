@@ -144,8 +144,8 @@ begin
   FocusedClass := string(ClassNameBuf);
 
   Result :=
-    ContainsText(FocusedClass, 'EditControl') or
-    ContainsText(FocusedClass, 'SynEdit');
+    StartsText('TEditControl', FocusedClass) or
+    StartsText('TSynEdit', FocusedClass);
 end;
 
 function GetSafeFileName(const Path: string): string;
